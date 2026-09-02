@@ -128,13 +128,13 @@ function extractContextUsage(dbPath) {
     for (const f of fields) {
       if (f.fieldNum === 9 && f.wireType === 2) {
         const u = parsePb(f.val);
-        let f5 = null;
-        let f2 = null;
+        let f5 = 0;
+        let f2 = 0;
         for (const item of u) {
           if (item.fieldNum === 5) f5 = item.val;
           if (item.fieldNum === 2) f2 = item.val;
         }
-        used = f5 !== null ? f5 : (f2 || 0);
+        used = f5 + f2;
       }
       if (f.fieldNum === 24 && f.wireType === 2) {
         const m = parsePb(f.val);
