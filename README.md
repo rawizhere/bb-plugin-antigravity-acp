@@ -88,6 +88,13 @@ bb provider models acp-antigravity
 bb thread spawn --provider acp-antigravity --prompt 'hi'
 ```
 
+## Model and reasoning selection
+
+Antigravity exposes effort variants as separate models (`... Low`, `... Medium`,
+and `... High`). Select the desired variant in the model picker. BB reasoning
+remains `Medium` because Antigravity's ACP server manages it internally; Fast
+mode is unavailable.
+
 ## Security notes
 
 - The ACP registry is fetched from a **pinned commit** (`REGISTRY_COMMIT`),
