@@ -1,16 +1,110 @@
 // Shared install logic for the Google Antigravity ACP server.
 // Runs on the target machine from the host entry, and directly in the server
 // process as the server-local fallback.
-import { execFile } from "node:child_process";
-import { createWriteStream } from "node:fs";
-import { chmod, copyFile, mkdir, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { randomBytes } from "node:crypto";
+import { execFile, spawn } from "node:child_process";
+import { constants as fsConstants, createWriteStream } from "node:fs";
+import { access, chmod, copyFile, mkdir, open, readdir, readFile, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
-import { basename, join } from "node:path";
+import { basename, join, resolve } from "node:path";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { promisify } from "node:util";
+import * as readline from "node:readline";
+import { renderWrapperScript } from "./wrapper-script.ts";
 
 const execFileAsync = promisify(execFile);
+
+function stderrTail(stderr: string): string {
+  return stderr.slice(-500).trim();
+}
+
+async function terminateChild(child: ReturnType<typeof spawn>): Promise<void> {
+  if (child.exitCode !== null || child.signalCode !== null) return;
+  await new Promise<void>((resolve) => {
+    let finished = false;
+    const done = () => {
+      if (finished) return;
+      finished = true;
+      clearTimeout(killTimer);
+      resolve();
+    };
+    child.once("close", done);
+    child.kill("SIGTERM");
+    const killTimer = setTimeout(() => {
+      child.kill("SIGKILL");
+      done();
+    }, 2_000);
+    killTimer.unref();
+  });
+}
+
+export async function verifyAcpHandshake(
+  command: string,
+  args: string[],
+  timeoutMs = 20_000,
+): Promise<{ ok: boolean; error: string | null }> {
+  const handshakeEnv = { ...process.env };
+  delete handshakeEnv.ANTIGRAVITY_REAL_SERVER_PATH;
+  const child = spawn(command, args, { stdio: ["pipe", "pipe", "pipe"], env: handshakeEnv });
+  let stderr = "";
+  child.stderr?.on("data", (chunk: Buffer | string) => {
+    stderr = (stderr + chunk.toString()).slice(-500);
+  });
+
+  const result = await new Promise<{ ok: boolean; reason: string | null }>((resolveResult) => {
+    let settled = false;
+    const rl = child.stdout ? readline.createInterface({ input: child.stdout, crlfDelay: Infinity }) : null;
+    let timer: NodeJS.Timeout;
+
+    const settle = (ok: boolean, reason: string | null) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      rl?.close();
+      void terminateChild(child).finally(() => resolveResult({ ok, reason }));
+    };
+
+    timer = setTimeout(() => settle(false, "ACP initialize handshake timed out"), timeoutMs);
+    timer.unref();
+
+    rl?.on("line", (line) => {
+      let message: unknown;
+      try {
+        message = JSON.parse(line);
+      } catch {
+        settle(false, "ACP initialize handshake returned invalid JSON");
+        return;
+      }
+      if (
+        message &&
+        typeof message === "object" &&
+        (message as { id?: unknown }).id === 1 &&
+        (message as { result?: { protocolVersion?: unknown } }).result?.protocolVersion !== undefined
+      ) {
+        settle(true, null);
+      }
+    });
+    child.once("error", (error) => settle(false, `Could not start ACP server: ${error.message}`));
+    child.once("close", () => {
+      if (!settled) settle(false, "ACP server exited before completing initialize");
+    });
+
+    child.stdin?.on("error", (error) => {
+      if (!settled) settle(false, `Could not write ACP initialize request: ${error.message}`);
+    });
+    child.stdin?.end(JSON.stringify({
+      jsonrpc: "2.0",
+      id: 1,
+      method: "initialize",
+      params: { protocolVersion: 1, clientCapabilities: {} },
+    }) + "\n");
+  });
+
+  if (result.ok) return { ok: true, error: null };
+  const tail = stderrTail(stderr);
+  return { ok: false, error: [result.reason, tail].filter(Boolean).join(" — stderr: ") };
+}
 
 export interface DistEntry {
   archive: string;
@@ -277,8 +371,15 @@ async function helperNameIn(installDir: string, isWindows: boolean): Promise<str
   return entries.find((name) => expected.test(name)) ?? null;
 }
 
-async function ensureLinked(installDir: string, binDir: string, name: string, isWindows: boolean, notes: string[]): Promise<string> {
-  const target = join(installDir, name);
+async function ensureLinked(
+  installDir: string,
+  binDir: string,
+  name: string,
+  isWindows: boolean,
+  notes: string[],
+  sourceName = name,
+): Promise<string> {
+  const target = join(installDir, sourceName);
   const link = join(binDir, name);
   if (isWindows) {
     await copyFile(target, link);
@@ -293,6 +394,97 @@ async function ensureLinked(installDir: string, binDir: string, name: string, is
     await copyFile(target, link);
     return link;
   }
+}
+
+async function installWrapper(
+  binDir: string,
+  binaryName: string,
+  nodePath: string,
+  realBinaryPath: string,
+  args: string[],
+  notes: string[],
+): Promise<string> {
+  const wrapperTarget = join(binDir, binaryName);
+  const stagedTarget = join(
+    binDir,
+    `.agy_acp_server.par.staging-${process.pid}-${randomBytes(6).toString("hex")}`,
+  );
+  try {
+    await rm(stagedTarget, { force: true });
+    await writeFile(stagedTarget, renderWrapperScript({ nodePath, realBinaryPath }), { mode: 0o755 });
+    await chmod(stagedTarget, 0o755);
+    const handshake = await verifyAcpHandshake(stagedTarget, args);
+    if (!handshake.ok) {
+      throw new Error(handshake.error ?? "unknown error");
+    }
+    await rename(stagedTarget, wrapperTarget);
+  } catch (err) {
+    await rm(stagedTarget, { force: true }).catch(() => {});
+    throw new Error(`ACP wrapper handshake/install failed: ${(err as Error).message}`);
+  }
+  notes.push(`Installed ACP context usage proxy wrapper: ${wrapperTarget}`);
+  return wrapperTarget;
+}
+
+// The host entry runs inside the bb app (Electron with ELECTRON_RUN_AS_NODE),
+// so process.execPath is not a node binary. Probe real candidates instead and
+// pin the executable path node itself reports, which skips version-manager
+// shims like fnm/volta/vite-plus launchers.
+async function nodeCandidates(): Promise<string[]> {
+  const out: string[] = [];
+  const push = (p: string | null | undefined) => {
+    if (p && !out.includes(p)) out.push(p);
+  };
+  push(process.env.ANTIGRAVITY_NODE_PATH?.trim());
+  if (/^node(\.exe)?$/iu.test(basename(process.execPath))) push(process.execPath);
+  push(await findOnPath("node"));
+  const home = homedir();
+  for (const dir of [
+    join(home, ".local", "bin"),
+    "/opt/homebrew/bin",
+    "/usr/local/bin",
+    join(home, ".volta", "bin"),
+    join(home, ".fnm", "aliases", "default", "bin"),
+    join(home, ".nvm", "versions", "node"),
+  ]) {
+    if (dir.endsWith(join(".nvm", "versions", "node"))) {
+      const versions = await readdir(dir).catch(() => [] as string[]);
+      for (const v of versions.sort().reverse()) push(join(dir, v, "bin", "node"));
+      continue;
+    }
+    push(join(dir, "node"));
+  }
+  return out;
+}
+
+async function verifyNodeInterpreter(): Promise<{ path: string; version: string }> {
+  const check = "require('node:sqlite'); process.stdout.write(process.versions.node + '\\n' + process.execPath)";
+  const failures: string[] = [];
+  for (const candidate of await nodeCandidates()) {
+    if (!(await stat(candidate).catch(() => null))?.isFile()) continue;
+    let stdout: string;
+    try {
+      ({ stdout } = await execFileAsync(candidate, ["-e", check], { timeout: 10_000 }));
+    } catch (err) {
+      failures.push(`${candidate}: ${(err as Error).message.split("\n")[0]}`);
+      continue;
+    }
+    const [version = "", execPath = ""] = stdout.trim().split(/\r?\n/u);
+    const match = /^(\d+)\.(\d+)\./u.exec(version);
+    const major = match ? Number(match[1]) : NaN;
+    const minor = match ? Number(match[2]) : NaN;
+    if (!match || major < 22 || (major === 22 && minor < 13)) {
+      failures.push(`${candidate}: Node ${version || "unknown"} (need 22.13+)`);
+      continue;
+    }
+    const pinned = (await stat(execPath).catch(() => null))?.isFile() ? execPath : candidate;
+    return { path: pinned, version };
+  }
+  throw new Error(
+    "No Node 22.13+ interpreter with node:sqlite found for the usage wrapper. " +
+    "Install Node or set ANTIGRAVITY_NODE_PATH." +
+    (failures.length ? " Tried: " + failures.join("; ") : ""),
+  );
 }
 
 // Only runs when the user explicitly opts in via --update-path. setx has a
@@ -329,12 +521,14 @@ async function writeManifest(
   url: string,
   binaryName: string,
   helper: string | null,
+  wrapper: string | null,
+  nodePath: string | null,
   args: string[],
   registryCommit: string,
 ): Promise<void> {
   await writeFile(
     join(installDir, MANIFEST),
-    JSON.stringify({ url, binaryName, helper, args, registryCommit, installedAt: new Date().toISOString() }, null, 2),
+    JSON.stringify({ url, binaryName, helper, wrapper, nodePath, args, registryCommit, installedAt: new Date().toISOString() }, null, 2),
     "utf8",
   );
 }
@@ -368,14 +562,29 @@ export async function runInstall(options: InstallOptions): Promise<InstallResult
     return fail(`Could not create directories: ${(err as Error).message}`);
   }
 
-  // Already installed and not forced: just make sure the links are in place.
+  // Already installed and not forced: just make sure the links and wrapper are in place.
   const existing = await stat(binaryPath).catch(() => null);
   if (existing?.isFile() && !options.force) {
     try {
       const helper = await helperNameIn(installDir, target.isWindows);
-      const link = await ensureLinked(installDir, binDir, binaryName, target.isWindows, notes);
+      let link: string;
+      let wrapper: string | null = null;
+      let nodePath: string | null = null;
+      if (target.isWindows) {
+        link = await ensureLinked(installDir, binDir, binaryName, true, notes, binaryName);
+        notes.push("Context usage injection is not available on Windows yet.");
+      } else {
+        const node = await verifyNodeInterpreter();
+        nodePath = node.path;
+        notes.push(`Using verified Node ${node.version} at ${node.path}.`);
+        await ensureLinked(installDir, binDir, "agy_acp_server_raw.par", false, notes, binaryName);
+        wrapper = await installWrapper(binDir, binaryName, node.path, resolve(installDir, binaryName), entry.args ?? [], notes);
+        link = wrapper;
+      }
       if (helper) await ensureLinked(installDir, binDir, helper, target.isWindows, notes);
-      notes.push("Binary already present; refreshed symlinks without re-downloading.");
+      if (target.isWindows) await appendUserPathWindows(binDir, options.updatePath === true, notes);
+      await writeManifest(installDir, entry.archive, binaryName, helper, wrapper, nodePath, entry.args ?? [], REGISTRY_COMMIT);
+      notes.push("Binary already present; refreshed symlinks and context usage wrapper without re-downloading.");
       return {
         ok: true, platform: target.platform, arch: target.arch, distKey: target.distKey, url: entry.archive,
         args: entry.args ?? [], registryCommit: REGISTRY_COMMIT,
@@ -390,7 +599,7 @@ export async function runInstall(options: InstallOptions): Promise<InstallResult
   // Explicit --from only. No environment-variable redirect: an env knob can
   // silently change which archive is downloaded and is easy to forget about.
   const sourceOverride = options.source?.trim();
-  let sourceLabel: string;
+  let sourceLabel: string = entry.archive;
   try {
     const zipPath = join(tmpdir(), `agy-acp-${Date.now()}.zip`);
     try {
@@ -421,26 +630,41 @@ export async function runInstall(options: InstallOptions): Promise<InstallResult
     return fail(`Extraction finished but ${binaryName} was not found in ${installDir}.`);
   }
 
+  let helper: string | null = null;
+  let link: string | null = null;
+  let wrapper: string | null = null;
+  let nodePath: string | null = null;
   try {
     if (!target.isWindows) {
       await chmod(binaryPath, 0o755);
     }
-    const helper = await helperNameIn(installDir, target.isWindows);
+    helper = await helperNameIn(installDir, target.isWindows);
     if (helper) {
       const full = join(installDir, helper);
       if (!target.isWindows) await chmod(full, 0o755);
       notes.push(`Sandbox helper: ${full}`);
     }
-    await writeManifest(installDir, sourceLabel, binaryName, helper, entry.args ?? [], REGISTRY_COMMIT);
+    if (!target.isWindows) {
+      const node = await verifyNodeInterpreter();
+      nodePath = node.path;
+      notes.push(`Using verified Node ${node.version} at ${node.path}.`);
+    }
   } catch (err) {
-    notes.push(`Post-install step failed (continuing): ${(err as Error).message}`);
+    return fail(`Post-install verification failed: ${(err as Error).message}`);
   }
 
-  const link = await ensureLinked(installDir, binDir, binaryName, target.isWindows, notes).catch((err) => {
-    notes.push(`Linking ${binaryName} failed: ${(err as Error).message}`);
-    return null;
-  });
-  const helper = await helperNameIn(installDir, target.isWindows);
+  try {
+    if (target.isWindows) {
+      link = await ensureLinked(installDir, binDir, binaryName, true, notes, binaryName);
+      notes.push("Context usage injection is not available on Windows yet.");
+    } else {
+      await ensureLinked(installDir, binDir, "agy_acp_server_raw.par", false, notes, binaryName);
+      wrapper = await installWrapper(binDir, binaryName, nodePath!, resolve(installDir, binaryName), entry.args ?? [], notes);
+      link = wrapper;
+    }
+  } catch (err) {
+    return fail(`Could not install the ${target.isWindows ? "binary" : "raw link or wrapper"}: ${(err as Error).message}`);
+  }
   if (link && helper) {
     await ensureLinked(installDir, binDir, helper, target.isWindows, notes).catch((err) => {
       notes.push(`Linking ${helper} failed: ${(err as Error).message}`);
@@ -458,6 +682,11 @@ export async function runInstall(options: InstallOptions): Promise<InstallResult
     );
   }
 
+  try {
+    await writeManifest(installDir, sourceLabel, binaryName, helper, wrapper, nodePath, entry.args ?? [], REGISTRY_COMMIT);
+  } catch (err) {
+    notes.push(`Manifest write failed: ${(err as Error).message}`);
+  }
   return {
     ok: true, platform: target.platform, arch: target.arch, distKey: target.distKey, url: sourceLabel,
     args: entry.args ?? [], registryCommit: REGISTRY_COMMIT,
@@ -483,12 +712,90 @@ export async function probeLocal(): Promise<ProbeResult> {
     }
     if (!harnessPath) harnessPath = await findOnPath("localharness_external" + (target.isWindows ? ".exe" : ""));
   }
+  let error: string | null = binaryPath
+    ? null
+    : `\`${binaryName}\` was not found on PATH. Install it with \`bb google-antigravity-acp install\`.`;
+  if (binaryPath && target.isWindows && !(await stat(binaryPath).catch(() => null))?.isFile()) {
+    error = `Antigravity launch target ${binaryPath} is not a file.`;
+  }
+  if (binaryPath && !target.isWindows) {
+    try {
+      try {
+        await access(binaryPath, fsConstants.X_OK);
+      } catch {
+        error = `Antigravity launch target ${binaryPath} is not executable.`;
+      }
+      const file = await open(binaryPath, "r");
+      let prefix: Buffer;
+      try {
+        prefix = Buffer.alloc(4096);
+        const { bytesRead } = await file.read(prefix, 0, prefix.length, 0);
+        prefix = prefix.subarray(0, bytesRead);
+      } finally {
+        await file.close();
+      }
+      const firstLine = prefix.toString("utf8").split(/\r?\n/u, 1)[0];
+      if (firstLine.startsWith("#!") && prefix.toString("utf8").includes("agy-acp-wrapper")) {
+        const content = await readFile(binaryPath, "utf8");
+        const interpreter = firstLine.slice(2).trim();
+        let interpreterPath: string | null = interpreter;
+        if (interpreter === "/usr/bin/env node") {
+          interpreterPath = await findOnPath("node");
+          if (!interpreterPath) {
+            error = `Antigravity wrapper at ${binaryPath} uses /usr/bin/env node, but node was not found on PATH.`;
+          }
+        }
+        if (interpreterPath) {
+          let interpreterExecutable = true;
+          if (!(await stat(interpreterPath).catch(() => null))?.isFile()) {
+            interpreterExecutable = false;
+            error = `Antigravity wrapper at ${binaryPath} uses missing interpreter ${interpreterPath}.`;
+          }
+          try {
+            if (interpreterExecutable) await access(interpreterPath, fsConstants.X_OK);
+          } catch {
+            interpreterExecutable = false;
+            error = `Antigravity wrapper at ${binaryPath} uses non-executable interpreter ${interpreterPath}.`;
+          }
+          if (interpreterExecutable) {
+            try {
+              await execFileAsync(interpreterPath, ["-e", "require('node:sqlite')"], { timeout: 5_000 });
+            } catch (err) {
+              error = `Antigravity wrapper interpreter ${interpreterPath} failed node:sqlite verification: ${(err as Error).message}`;
+            }
+          }
+        }
+
+        const match = /const\s+INSTALLED_REAL_BINARY\s*=\s*(null|"(?:\\.|[^"\\])*")\s*;/u.exec(content);
+        if (!match) {
+          error ??= `Antigravity wrapper at ${binaryPath} has no INSTALLED_REAL_BINARY path.`;
+        } else {
+          const installedPath = JSON.parse(match[1]) as string | null;
+          if (!installedPath) {
+            error = `Antigravity wrapper at ${binaryPath} has no installed real binary path.`;
+          } else {
+            if (!(await stat(installedPath).catch(() => null))?.isFile()) {
+              error = `Antigravity wrapper at ${binaryPath} points to missing real binary ${installedPath}.`;
+            } else {
+              try {
+                await access(installedPath, fsConstants.X_OK);
+              } catch {
+                error = `Antigravity wrapper at ${binaryPath} points to non-executable real binary ${installedPath}.`;
+              }
+            }
+          }
+        }
+      }
+    } catch (err) {
+      error = `Could not inspect ${binaryPath}: ${(err as Error).message}`;
+    }
+  }
   return {
-    ok: binaryPath !== null,
+    ok: error === null,
     platform: target.platform,
     arch: target.arch,
     binaryPath,
     harnessPath,
-    error: binaryPath ? null : `\`${binaryName}\` was not found on PATH. Install it with \`bb google-antigravity-acp install\`.`,
+    error,
   };
 }
