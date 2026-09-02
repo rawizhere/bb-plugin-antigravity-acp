@@ -100,7 +100,7 @@ mode is unavailable.
 
 Google's official `agy_acp_server.par` tracks exact token usage inside its local conversation database (`~/.gemini/antigravity-acp/conversations/<sessionId>.db`), but omits emitting `usage_update` over the ACP stdio bridge.
 
-This plugin automatically installs a lightweight transparent proxy wrapper (`agy-acp-wrapper`) as `agy_acp_server.par` while keeping the official raw binary intact (`agy_acp_server_raw.par`). The wrapper reads token usage metadata in real time from the session database and injects standard ACP `session/update` (`usage_update`) events with `used` and `size` (1M token window) before turn completion.
+The POSIX install renders a lightweight transparent proxy wrapper as `agy_acp_server.par`, pinning the verified Node interpreter and installed real-binary path while keeping the official raw binary intact (`agy_acp_server_raw.par`). Installation verifies an ACP `initialize` handshake before succeeding. Windows currently runs the raw binary without context usage injection. The POSIX wrapper reads token usage metadata in real time from the session database and injects standard ACP `session/update` (`usage_update`) events with `used` and `size` before turn completion.
 
 This enables BB's native context window tracking and context meter plugins (such as `context-meter`) to display live token usage for Antigravity threads.
 

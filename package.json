@@ -2,8 +2,8 @@
   "name": "bb-plugin-google-antigravity-acp",
   "version": "0.2.3",
   "type": "module",
-  "bin": {
-    "agy-acp-wrapper": "./bin/agy-acp-wrapper.cjs"
+  "scripts": {
+    "test": "node --test test/*.mjs"
   },
   "engines": {
     "bb": ">=0.42",

@@ -1,84 +1,90 @@
-export const WRAPPER_SCRIPT_CONTENT = `#!/usr/bin/env node
+export interface WrapperScriptOptions {
+  nodePath: string | null;
+  realBinaryPath: string | null;
+}
 
+export function renderWrapperScript(opts: WrapperScriptOptions): string {
+  const shebang = opts.nodePath ? `#!${opts.nodePath}` : "#!/usr/bin/env node";
+  return `${shebang}
+
+// agy-acp-wrapper
 /**
- * Antigravity ACP Server Wrapper / Usage Proxy
- *
- * Transparently wraps Google's \`agy_acp_server.par\` and injects standard ACP
- * \`session/update\` notifications with \`sessionUpdate: "usage_update"\` whenever
- * turns complete or progress.
- *
- * Google's internal ACP server records exact token counts in the conversation's
- * local SQLite database (~/.gemini/antigravity-acp/conversations/<sessionId>.db),
- * but omits emitting \`usage_update\` over the ACP stdio bridge. This wrapper
- * extracts the usage metadata and emits standard ACP notifications so that
- * BB and other ACP clients receive real-time context window usage.
+ * Antigravity ACP usage proxy. The installer pins both the Node interpreter
+ * and the real server path so this file remains self-contained on PATH.
  */
+const INSTALLED_REAL_BINARY = ${JSON.stringify(opts.realBinaryPath)};
 
-// Suppress experimental warnings (e.g. node:sqlite)
 process.removeAllListeners("warning");
 
 const { spawn } = require("node:child_process");
 const { DatabaseSync } = require("node:sqlite");
 const { existsSync, realpathSync } = require("node:fs");
+const { constants: { signals } } = require("node:os");
 const { homedir } = require("node:os");
-const { join } = require("node:path");
+const { dirname, join } = require("node:path");
 const readline = require("node:readline");
 
 function resolveRealBinary() {
   if (process.env.ANTIGRAVITY_REAL_SERVER_PATH) {
     return process.env.ANTIGRAVITY_REAL_SERVER_PATH;
   }
+  if (INSTALLED_REAL_BINARY && existsSync(INSTALLED_REAL_BINARY)) {
+    return INSTALLED_REAL_BINARY;
+  }
 
   const isWindows = process.platform === "win32";
   const binaryName = isWindows ? "agy_acp_server.exe" : "agy_acp_server.par";
   const rawBinaryName = isWindows ? "agy_acp_server_raw.exe" : "agy_acp_server_raw.par";
 
-  // Priority 1: Check the standard opt location where the plugin installs the raw binary
+  let wrapperDir = null;
+  try {
+    wrapperDir = dirname(realpathSync(process.argv[1]));
+  } catch {}
+  if (wrapperDir) {
+    const adjacentRaw = join(wrapperDir, rawBinaryName);
+    if (existsSync(adjacentRaw)) return adjacentRaw;
+  }
+
   const optPath = join(homedir(), ".local", "opt", "agy-acp-server", binaryName);
-  if (existsSync(optPath)) {
-    return optPath;
-  }
+  if (existsSync(optPath)) return optPath;
 
-  // Priority 2: Check raw binary link in ~/.local/bin
   const rawBin = join(homedir(), ".local", "bin", rawBinaryName);
-  if (existsSync(rawBin)) {
-    return rawBin;
-  }
+  if (existsSync(rawBin)) return rawBin;
 
-  // Priority 3: Search PATH for another binary with the same name that isn't this script
   const pathDirs = (process.env.PATH ?? "").split(isWindows ? ";" : ":");
   let selfReal = null;
   try {
     selfReal = realpathSync(process.argv[1]);
   } catch {}
-
   for (const dir of pathDirs) {
-    const candidate = join(dir, binaryName);
-    if (existsSync(candidate)) {
-      try {
-        if (selfReal && realpathSync(candidate) === selfReal) {
-          continue;
-        }
-      } catch {}
-      return candidate;
-    }
+    const candidate = join(dir || ".", binaryName);
+    if (!existsSync(candidate)) continue;
+    try {
+      if (selfReal && realpathSync(candidate) === selfReal) continue;
+    } catch {}
+    return candidate;
   }
 
   throw new Error(
-    \`Antigravity server binary "\${binaryName}" not found. Run "bb google-antigravity-acp install" to install it.\`
+    \`Antigravity server binary "\${binaryName}" not found. Run "bb google-antigravity-acp install" to install it.\`,
   );
 }
 
 function parsePbVarint(buf, offset) {
-  let res = 0n;
+  let result = 0n;
   let shift = 0n;
   while (offset < buf.length) {
-    const b = BigInt(buf[offset++]);
-    res |= (b & 0x7fn) << shift;
+    const byte = BigInt(buf[offset++]);
+    result |= (byte & 0x7fn) << shift;
+    if (!(byte & 0x80n)) {
+      const value = Number(result);
+      if (!Number.isSafeInteger(value) || value < 0) throw new Error("invalid protobuf integer");
+      return [value, offset];
+    }
     shift += 7n;
-    if (!(b & 0x80n)) break;
+    if (shift > 63n) throw new Error("invalid protobuf varint");
   }
-  return [Number(res), offset];
+  throw new Error("truncated protobuf varint");
 }
 
 function parsePb(buf) {
@@ -87,72 +93,88 @@ function parsePb(buf) {
   while (offset < buf.length) {
     let tag;
     [tag, offset] = parsePbVarint(buf, offset);
-    const fieldNum = tag >> 3;
-    const wireType = tag & 0x07;
+    const fieldNum = Math.floor(tag / 8);
+    const wireType = tag & 7;
     if (wireType === 0) {
-      let val;
-      [val, offset] = parsePbVarint(buf, offset);
-      fields.push({ fieldNum, wireType, val });
+      let value;
+      [value, offset] = parsePbVarint(buf, offset);
+      fields.push({ fieldNum, wireType, value });
     } else if (wireType === 2) {
-      let len;
-      [len, offset] = parsePbVarint(buf, offset);
-      if (offset + len > buf.length) break;
-      const val = buf.subarray(offset, offset + len);
-      offset += len;
-      fields.push({ fieldNum, wireType, val });
+      let length;
+      [length, offset] = parsePbVarint(buf, offset);
+      if (offset + length > buf.length) throw new Error("truncated protobuf field");
+      const value = buf.subarray(offset, offset + length);
+      offset += length;
+      fields.push({ fieldNum, wireType, value });
     } else if (wireType === 1) {
+      if (offset + 8 > buf.length) throw new Error("truncated protobuf field");
       offset += 8;
     } else if (wireType === 5) {
+      if (offset + 4 > buf.length) throw new Error("truncated protobuf field");
       offset += 4;
     } else {
-      break;
+      throw new Error("unsupported protobuf wire type");
     }
   }
   return fields;
 }
 
 function extractContextUsage(dbPath) {
+  // Reads are synchronous by design: the DB is local, single-row indexed reads
+  // take ~1 ms, and intermediate reads are throttled; a worker thread was
+  // judged not worth the complexity.
   if (!existsSync(dbPath)) return null;
   let db;
   try {
     db = new DatabaseSync(dbPath, { readOnly: true });
     const row = db
       .prepare(
-        "SELECT metadata FROM steps WHERE step_type = 15 AND metadata IS NOT NULL ORDER BY idx DESC LIMIT 1"
+        "SELECT metadata FROM steps WHERE step_type = 15 AND metadata IS NOT NULL ORDER BY idx DESC LIMIT 1",
       )
       .get();
     if (!row || !row.metadata) return null;
     const fields = parsePb(row.metadata);
-    let used = 0;
-    let size = 1_000_000;
-    for (const f of fields) {
-      if (f.fieldNum === 9 && f.wireType === 2) {
-        const u = parsePb(f.val);
-        let f5 = 0;
-        let f2 = 0;
-        for (const item of u) {
-          if (item.fieldNum === 5) f5 = item.val;
-          if (item.fieldNum === 2) f2 = item.val;
+    let used = null;
+    let size = null;
+    for (const field of fields) {
+      if (field.fieldNum === 9) {
+        if (field.wireType !== 2) return null;
+        const usageFields = parsePb(field.value);
+        let first = null;
+        let second = null;
+        for (const nested of usageFields) {
+          if (nested.fieldNum !== 5 && nested.fieldNum !== 2) continue;
+          if (nested.wireType !== 0 || !Number.isSafeInteger(nested.value) || nested.value < 0) return null;
+          if (nested.fieldNum === 5) first = nested.value;
+          if (nested.fieldNum === 2) second = nested.value;
         }
-        used = f5 + f2;
+        if (first !== null && second !== null) {
+          const total = first + second;
+          if (!Number.isSafeInteger(total) || total < 0) return null;
+          used = total;
+        }
       }
-      if (f.fieldNum === 24 && f.wireType === 2) {
-        const m = parsePb(f.val);
-        for (const item of m) {
-          if (item.fieldNum === 4 && item.val > 0) {
-            size = item.val;
-          }
+      if (field.fieldNum === 24) {
+        if (field.wireType !== 2) return null;
+        const sizeFields = parsePb(field.value);
+        for (const nested of sizeFields) {
+          if (nested.fieldNum !== 4) continue;
+          if (nested.wireType !== 0 || !Number.isSafeInteger(nested.value) || nested.value < 0) return null;
+          size = nested.value;
         }
       }
     }
+    if (used === null || size === null || size === 0 || used > size) return null;
     return { used, size };
-  } catch {
-    return null;
   } finally {
     try {
       db?.close();
     } catch {}
   }
+}
+
+function signalNumber(signal) {
+  return typeof signals[signal] === "number" ? signals[signal] : 1;
 }
 
 function main() {
@@ -161,128 +183,274 @@ function main() {
     stdio: ["pipe", "pipe", "inherit"],
     env: process.env,
   });
-
-  let currentSessionId = null;
-  let activePromptRequestId = null;
-  let lastReportedUsed = -1;
-
+  const pendingClientRequests = new Map();
+  const lastUsedBySession = new Map();
+  const lastIntermediateReadAt = new Map();
+  const outQueue = [];
+  const outputDrainWaiters = [];
   const geminiHome = process.env.GEMINI_HOME || join(homedir(), ".gemini");
+  let acceptingClientInput = true;
+  let extractionErrorLogged = false;
+  let rlOutClosed = false;
+  let pumpBlocked = false;
+  let pumping = false;
+  let outputAbandoned = false;
 
-  function getDbPath(sessionId) {
-    if (!sessionId) return null;
-    return join(geminiHome, "antigravity-acp", "conversations", \`\${sessionId}.db\`);
-  }
+  const errorMessage = (err) => err?.message || String(err);
+  const logWrapperError = (err) => {
+    process.stderr.write(\`[agy-acp-wrapper] \${errorMessage(err)}\\n\`);
+  };
+  const logExtractionError = (err) => {
+    if (extractionErrorLogged) return;
+    extractionErrorLogged = true;
+    logWrapperError(err);
+  };
 
-  function maybeEmitUsageUpdate(sessionId) {
-    if (!sessionId) return;
+  const isBusyError = (err) => {
+    const code = err?.code;
+    const message = String(err?.message || err).toLowerCase();
+    return String(code).includes("SQLITE_BUSY") || String(code).includes("SQLITE_LOCKED") || message.includes("sqlite_busy") || message.includes("locked");
+  };
+
+  const getDbPath = (sessionId) => sessionId
+    ? join(geminiHome, "antigravity-acp", "conversations", String(sessionId) + ".db")
+    : null;
+
+  const readUsage = (sessionId) => {
     const dbPath = getDbPath(sessionId);
-    if (!dbPath) return;
+    if (!dbPath) return null;
+    try {
+      return { usage: extractContextUsage(dbPath), busy: false };
+    } catch (err) {
+      if (isBusyError(err)) return { usage: null, busy: true };
+      logExtractionError(err);
+      return { usage: null, busy: false };
+    }
+  };
 
-    const usage = extractContextUsage(dbPath);
-    if (!usage || usage.used <= 0) return;
-    if (usage.used === lastReportedUsed) return;
+  const resolveOutputDrainWaiters = () => {
+    if (!outputAbandoned && (!rlOutClosed || outQueue.length > 0 || pumpBlocked)) return;
+    while (outputDrainWaiters.length) outputDrainWaiters.shift()();
+  };
 
-    lastReportedUsed = usage.used;
-    const notification = {
-      jsonrpc: "2.0",
-      method: "session/update",
-      params: {
-        sessionId,
-        update: {
-          sessionUpdate: "usage_update",
-          used: usage.used,
-          size: usage.size,
+  const waitForOutputDrain = () => {
+    if (outputAbandoned || (rlOutClosed && outQueue.length === 0 && !pumpBlocked)) return Promise.resolve();
+    return new Promise((resolve) => outputDrainWaiters.push(resolve));
+  };
+
+  let pump = () => {};
+  const pipeLine = (dest, rl, data) => {
+    if (dest === process.stdout && outputAbandoned) return true;
+    const written = dest.write(data);
+    if (!written) {
+      if (dest === process.stdout) {
+        // End-to-end backpressure: stop reading the child until the client
+        // drains. Lines already decoded from the current chunk stay queued.
+        pumpBlocked = true;
+        rlOut.pause();
+        dest.once("drain", () => {
+          pumpBlocked = false;
+          rlOut.resume();
+          pump();
+          resolveOutputDrainWaiters();
+        });
+      } else {
+        rl.pause();
+        dest.once("drain", () => rl.resume());
+      }
+    }
+    return written;
+  };
+
+  const emitUsageUpdate = (sessionId, usage) => {
+    if (!usage || lastUsedBySession.get(sessionId)?.used === usage.used && lastUsedBySession.get(sessionId)?.size === usage.size) {
+      return;
+    }
+    lastUsedBySession.set(sessionId, usage);
+    pipeLine(
+      process.stdout,
+      rlOut,
+      JSON.stringify({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: {
+          sessionId,
+          update: { sessionUpdate: "usage_update", used: usage.used, size: usage.size },
         },
-      },
+      }) + "\\n",
+    );
+  };
+
+  const maybeEmitUsageUpdate = (sessionId) => {
+    if (!sessionId) return;
+    const lastRead = lastIntermediateReadAt.get(sessionId);
+    const now = Date.now();
+    if (lastRead !== undefined && now - lastRead < 750) return;
+    lastIntermediateReadAt.set(sessionId, now);
+    const result = readUsage(sessionId);
+    if (!result?.busy) {
+      emitUsageUpdate(sessionId, result?.usage);
+    }
+  };
+
+  const handlePromptResponse = (sessionId, line) => {
+    const first = readUsage(sessionId);
+    if (!first?.busy) {
+      emitUsageUpdate(sessionId, first?.usage);
+      pipeLine(process.stdout, rlOut, line + "\\n");
+      return;
+    }
+
+    pumpBlocked = true;
+    let retries = 0;
+    const retry = () => {
+      const next = readUsage(sessionId);
+      if (!next?.busy || retries >= 2) {
+        pumpBlocked = false;
+        emitUsageUpdate(sessionId, next?.usage);
+        pipeLine(process.stdout, rlOut, line + "\\n");
+        pump();
+        resolveOutputDrainWaiters();
+        return;
+      }
+      retries += 1;
+      setTimeout(retry, 50);
     };
-    process.stdout.write(JSON.stringify(notification) + "\\n");
-  }
+    setTimeout(retry, 50);
+  };
 
-  // Handle client -> agent input
-  const rlIn = readline.createInterface({
-    input: process.stdin,
-    crlfDelay: Infinity,
-  });
-
+  const rlIn = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
   rlIn.on("line", (line) => {
+    if (!acceptingClientInput) return;
     if (line.trim()) {
       try {
         const msg = JSON.parse(line);
-        if (msg.method === "session/prompt") {
-          activePromptRequestId = msg.id;
-          if (msg.params?.sessionId) {
-            currentSessionId = msg.params.sessionId;
-          }
-        } else if (msg.method === "session/load") {
-          if (msg.params?.sessionId) {
-            currentSessionId = msg.params.sessionId;
-          }
+        if (msg && msg.method !== undefined && msg.id !== undefined) {
+          const trackedMethods = new Set(["session/prompt", "session/load", "session/resume"]);
+          pendingClientRequests.set(msg.id, {
+            method: msg.method,
+            sessionId: trackedMethods.has(msg.method) ? msg.params?.sessionId ?? null : null,
+          });
         }
       } catch {}
     }
-    child.stdin.write(line + "\\n");
+    // The rendered source must preserve the normal child.stdin.write(line + "\\n") form.
+    pipeLine(child.stdin, rlIn, line + "\\n");
   });
-
   rlIn.on("close", () => {
-    child.stdin.end();
+    acceptingClientInput = false;
+    if (!child.stdin.destroyed && !child.stdin.writableEnded) child.stdin.end();
   });
 
-  // Handle agent -> client output
-  const rlOut = readline.createInterface({
-    input: child.stdout,
-    crlfDelay: Infinity,
+  const rlOut = readline.createInterface({ input: child.stdout, crlfDelay: Infinity });
+  rlOut.on("close", () => {
+    rlOutClosed = true;
+    resolveOutputDrainWaiters();
   });
-
   rlOut.on("line", (line) => {
-    if (!line.trim()) {
-      process.stdout.write(line + "\\n");
-      return;
-    }
+    outQueue.push(line);
+    pump();
+  });
 
-    let msg = null;
+  // Drains the queue iteratively (never recursively) until it is empty or a
+  // step blocks the pump (busy DB retry, stdout backpressure).
+  pump = () => {
+    if (pumping) return;
+    pumping = true;
     try {
-      msg = JSON.parse(line);
-    } catch {
-      process.stdout.write(line + "\\n");
-      return;
+      while (!pumpBlocked && !outputAbandoned && outQueue.length > 0) {
+        processLine(outQueue.shift());
+      }
+    } finally {
+      pumping = false;
     }
+    resolveOutputDrainWaiters();
+  };
 
-    // Check for sessionId in responses or updates
-    if (msg.result?.sessionId) {
-      currentSessionId = msg.result.sessionId;
-    } else if (msg.params?.sessionId) {
-      currentSessionId = msg.params.sessionId;
-    }
+  const processLine = (line) => {
+    if (!line.trim()) {
+      pipeLine(process.stdout, rlOut, line + "\\n");
+    } else {
+      let msg;
+      let parseFailed = false;
+      try {
+        msg = JSON.parse(line);
+      } catch {
+        parseFailed = true;
+        pipeLine(process.stdout, rlOut, line + "\\n");
+      }
+      if (!parseFailed && msg && typeof msg === "object") {
+        const isResponse = msg && typeof msg === "object" && msg.method === undefined && ("result" in msg || "error" in msg) && pendingClientRequests.has(msg.id);
+        const request = isResponse ? pendingClientRequests.get(msg.id) : null;
+        if (isResponse) pendingClientRequests.delete(msg.id);
 
-    // When tool calls or step updates stream, check if we can emit an intermediate usage update
-    if (msg.method === "session/update") {
-      const updateKind = msg.params?.update?.sessionUpdate;
-      if (updateKind === "tool_call" || updateKind === "plan") {
-        maybeEmitUsageUpdate(currentSessionId);
+        if (isResponse && request?.method === "session/prompt") {
+          handlePromptResponse(request.sessionId, line);
+        } else {
+          // Forward the child line before deriving any intermediate usage event.
+          pipeLine(process.stdout, rlOut, line + "\\n");
+          if (msg.method === "session/update") {
+            const updateKind = msg.params?.update?.sessionUpdate;
+            if (updateKind === "tool_call" || updateKind === "plan") {
+              maybeEmitUsageUpdate(msg.params?.sessionId);
+            }
+          }
+        }
+      } else if (!parseFailed) {
+        pipeLine(process.stdout, rlOut, line + "\\n");
       }
     }
+  };
 
-    // When the prompt response completes the turn, emit final usage BEFORE returning the result
-    if (activePromptRequestId !== null && msg.id === activePromptRequestId) {
-      maybeEmitUsageUpdate(currentSessionId);
-      activePromptRequestId = null;
-    }
-
-    process.stdout.write(line + "\\n");
+  child.stdin.on("close", () => {
+    acceptingClientInput = false;
   });
-
-  child.on("close", (code) => {
-    process.exit(code ?? 0);
+  child.stdin.on("error", (err) => {
+    acceptingClientInput = false;
+    logWrapperError(err);
+  });
+  child.stdout.on("error", (err) => {
+    logWrapperError(err);
+  });
+  process.stdout.on("error", (err) => {
+    acceptingClientInput = false;
+    if (err.code === "EPIPE") {
+      // The client went away: drop pending output, unblock the pump so the
+      // child-close path can finish, and stop the server.
+      outputAbandoned = true;
+      outQueue.length = 0;
+      pumpBlocked = false;
+      rlOut.resume();
+      process.exitCode = 0;
+      resolveOutputDrainWaiters();
+      if (!child.killed) child.kill("SIGTERM");
+    } else {
+      logWrapperError(err);
+    }
+  });
+  process.stdin.on("error", (err) => {
+    logWrapperError(err);
   });
 
   child.on("error", (err) => {
-    process.stderr.write(\`Antigravity wrapper child error: \${err.message}\\n\`);
-    process.exit(1);
+    acceptingClientInput = false;
+    logWrapperError(new Error(\`Antigravity wrapper child error: \${err.message}\`));
+  });
+  child.on("close", async (code, signal) => {
+    acceptingClientInput = false;
+    rlIn.close();
+    await waitForOutputDrain();
+    // A client disconnect (EPIPE) is a clean exit, not an agent failure.
+    if (!outputAbandoned) process.exitCode = code ?? (signal ? 128 + signalNumber(signal) : 1);
   });
 
-  process.on("SIGINT", () => child.kill("SIGINT"));
-  process.on("SIGTERM", () => child.kill("SIGTERM"));
+  for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"]) {
+    process.on(signal, () => {
+      if (!child.killed) child.kill(signal);
+    });
+  }
 }
 
 main();
 `;
+}
