@@ -2,6 +2,9 @@
   "name": "bb-plugin-google-antigravity-acp",
   "version": "0.2.3",
   "type": "module",
+  "bin": {
+    "agy-acp-wrapper": "./bin/agy-acp-wrapper.cjs"
+  },
   "engines": {
     "bb": ">=0.42",
     "bbPluginSdk": ">=0.4.45"

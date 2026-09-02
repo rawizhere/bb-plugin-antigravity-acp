@@ -9,6 +9,7 @@ import { basename, join } from "node:path";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { promisify } from "node:util";
+import { WRAPPER_SCRIPT_CONTENT } from "./wrapper-script.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -277,8 +278,15 @@ async function helperNameIn(installDir: string, isWindows: boolean): Promise<str
   return entries.find((name) => expected.test(name)) ?? null;
 }
 
-async function ensureLinked(installDir: string, binDir: string, name: string, isWindows: boolean, notes: string[]): Promise<string> {
-  const target = join(installDir, name);
+async function ensureLinked(
+  installDir: string,
+  binDir: string,
+  name: string,
+  isWindows: boolean,
+  notes: string[],
+  sourceName = name,
+): Promise<string> {
+  const target = join(installDir, sourceName);
   const link = join(binDir, name);
   if (isWindows) {
     await copyFile(target, link);
@@ -293,6 +301,20 @@ async function ensureLinked(installDir: string, binDir: string, name: string, is
     await copyFile(target, link);
     return link;
   }
+}
+
+async function installWrapper(binDir: string, binaryName: string, isWindows: boolean, notes: string[]): Promise<string> {
+  const wrapperTarget = join(binDir, binaryName);
+  await rm(wrapperTarget, { force: true }).catch(() => {});
+  await writeFile(wrapperTarget, WRAPPER_SCRIPT_CONTENT, { mode: 0o755 });
+  if (!isWindows) {
+    await chmod(wrapperTarget, 0o755);
+  } else {
+    const cmdPath = join(binDir, "agy_acp_server.cmd");
+    await writeFile(cmdPath, `@echo off\r\nnode "%~dp0\\${binaryName}" %*\r\n`);
+  }
+  notes.push(`Installed ACP context usage proxy wrapper: ${wrapperTarget}`);
+  return wrapperTarget;
 }
 
 // Only runs when the user explicitly opts in via --update-path. setx has a
@@ -368,14 +390,16 @@ export async function runInstall(options: InstallOptions): Promise<InstallResult
     return fail(`Could not create directories: ${(err as Error).message}`);
   }
 
-  // Already installed and not forced: just make sure the links are in place.
+  // Already installed and not forced: just make sure the links and wrapper are in place.
   const existing = await stat(binaryPath).catch(() => null);
   if (existing?.isFile() && !options.force) {
     try {
       const helper = await helperNameIn(installDir, target.isWindows);
-      const link = await ensureLinked(installDir, binDir, binaryName, target.isWindows, notes);
+      const rawBinaryName = target.isWindows ? "agy_acp_server_raw.exe" : "agy_acp_server_raw.par";
+      await ensureLinked(installDir, binDir, rawBinaryName, target.isWindows, notes, binaryName);
+      const link = await installWrapper(binDir, binaryName, target.isWindows, notes);
       if (helper) await ensureLinked(installDir, binDir, helper, target.isWindows, notes);
-      notes.push("Binary already present; refreshed symlinks without re-downloading.");
+      notes.push("Binary already present; refreshed symlinks and context usage wrapper without re-downloading.");
       return {
         ok: true, platform: target.platform, arch: target.arch, distKey: target.distKey, url: entry.archive,
         args: entry.args ?? [], registryCommit: REGISTRY_COMMIT,
@@ -436,8 +460,12 @@ export async function runInstall(options: InstallOptions): Promise<InstallResult
     notes.push(`Post-install step failed (continuing): ${(err as Error).message}`);
   }
 
-  const link = await ensureLinked(installDir, binDir, binaryName, target.isWindows, notes).catch((err) => {
-    notes.push(`Linking ${binaryName} failed: ${(err as Error).message}`);
+  const rawBinaryName = target.isWindows ? "agy_acp_server_raw.exe" : "agy_acp_server_raw.par";
+  await ensureLinked(installDir, binDir, rawBinaryName, target.isWindows, notes, binaryName).catch((err) => {
+    notes.push(`Linking ${rawBinaryName} failed: ${(err as Error).message}`);
+  });
+  const link = await installWrapper(binDir, binaryName, target.isWindows, notes).catch((err) => {
+    notes.push(`Installing wrapper ${binaryName} failed: ${(err as Error).message}`);
     return null;
   });
   const helper = await helperNameIn(installDir, target.isWindows);

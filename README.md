@@ -16,8 +16,8 @@ builtin ACP agents:
   commands call, so installs run on the target machine, not on the bb server.
 - `install.ts` — shared install logic: resolves the official distribution
   from the ACP registry (pinned to a commit SHA), downloads, safely extracts,
-  and links the server binary and sandbox helper onto PATH (no environment
-  variables needed).
+  and links the server binary, usage proxy wrapper, and sandbox helper onto PATH
+  (no environment variables needed).
 - `icons/google-antigravity.svg` — provider mark (path-shaped, theme-tinted).
 
 ## Install the plugin
@@ -45,8 +45,9 @@ thread's host, or `--machine <id-or-name>` to pick another enrolled machine):
   `tar` (bsdtar does not sanitize `../` zip entries); it uses `unzip` or a
   validated `python3` zipfile extraction, and PowerShell's `Expand-Archive`
   on Windows;
-- symlinks `agy_acp_server.par` and its sandbox helper `localharness_external`
-  into `~/.local/bin` (configurable via `--bin-dir` / `binDir`); on Windows it
+- symlinks the raw binary `agy_acp_server_raw.par` and sandbox helper `localharness_external`
+  into `~/.local/bin` (configurable via `--bin-dir` / `binDir`), and installs the
+  lightweight ACP context usage proxy wrapper as `agy_acp_server.par`; on Windows it
   copies them and only appends the dir to the user PATH when you pass
   `--update-path` (setx permanently edits `HKCU\Environment` — opt in
   explicitly, and be aware of its 1024-character truncation limit);
@@ -94,6 +95,14 @@ Antigravity exposes effort variants as separate models (`... Low`, `... Medium`,
 and `... High`). Select the desired variant in the model picker. BB reasoning
 remains `Medium` because Antigravity's ACP server manages it internally; Fast
 mode is unavailable.
+
+## Context window usage reporting
+
+Google's official `agy_acp_server.par` tracks exact token usage inside its local conversation database (`~/.gemini/antigravity-acp/conversations/<sessionId>.db`), but omits emitting `usage_update` over the ACP stdio bridge.
+
+This plugin automatically installs a lightweight transparent proxy wrapper (`agy-acp-wrapper`) as `agy_acp_server.par` while keeping the official raw binary intact (`agy_acp_server_raw.par`). The wrapper reads token usage metadata in real time from the session database and injects standard ACP `session/update` (`usage_update`) events with `used` and `size` (1M token window) before turn completion.
+
+This enables BB's native context window tracking and context meter plugins (such as `context-meter`) to display live token usage for Antigravity threads.
 
 ## Security notes
 
