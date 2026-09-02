@@ -98,6 +98,18 @@ export default async function plugin(bb: BbPluginApi) {
       reasoningLevels: ["medium"],
     },
     composerActions: [],
+    experimental_nativeSkillRoots: {
+      user: [
+        ".agents/skills",
+        ".gemini/skills",
+        ".gemini/config/skills",
+        ".gemini/antigravity-cli/skills",
+      ],
+      project: [
+        { path: ".agents/skills", ancestors: true },
+        { path: ".gemini/skills", ancestors: true },
+      ],
+    },
     experimental_bridgeOptions: {
       acpLaunchSpec: LAUNCH,
     },
