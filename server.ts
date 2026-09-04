@@ -1,15 +1,10 @@
-// bb-plugin-google-antigravity-acp — Google Antigravity as a first-class bb
-// agent provider through the official Antigravity ACP server
-// (`agy_acp_server.par`).
-//
-// The provider id is `acp-antigravity` (same family "acp" as the builtin ACP
-// agents). Everything agent-specific the bridge needs travels in
-// `experimental_bridgeOptions.acpLaunchSpec`; the bridge itself is the
-// canonical ACP bridge shipped in host.ts.
+import type {
+  BbPluginApi,
+  PluginCliContext,
+} from "@get-bb/plugin-sdk";
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
-import { type BbPluginApi, type PluginCliContext } from "@get-bb/plugin-sdk";
+import os from "node:os";
 import { agyHostContract } from "./contract.js";
 import { FALLBACK_DIST, detectTarget, probeLocal, runInstall, type InstallResult } from "./install.js";
 
@@ -36,9 +31,9 @@ export default async function plugin(bb: BbPluginApi) {
     },
     defaultModel: {
       type: "string",
-      label: "Default model family",
+      label: "Default model",
       description:
-        "Preferred default model family (e.g. gemini-3.7-flash, gemini-3.1-pro). Leave empty to auto-select (prefers gemini-3.7-flash). Aligns with BB's per-provider default pattern.",
+        "Default model family for Google Antigravity threads (e.g. gemini-3.8-flash, gemini-3.7-flash, gemini-3.1-pro). Leave empty to use the latest Flash model.",
       default: "",
     },
     defaultReasoningEffort: {
@@ -49,7 +44,31 @@ export default async function plugin(bb: BbPluginApi) {
       default: "",
     },
   });
-  const saved = await settings.get();
+  let saved = await settings.get();
+
+  // Launch args come from the ACP registry (mirrored in FALLBACK_DIST): the
+  // registry specifies `--uid=` for linux-x86_64/linux-aarch64 only. The
+  // launch spec is registered server-side, so platform resolution uses the
+  // server's own platform — the common case where bb runs on the same machine
+  // that launches the agent. Installs record the per-platform args in their
+  // manifest too.
+  const launchArgs = FALLBACK_DIST[detectTarget().distKey]?.args ?? [];
+
+  function buildLaunchSpec(currentSettings: typeof saved) {
+    const env: Record<string, string> = {};
+    if (currentSettings.defaultModel?.trim()) {
+      env.BB_ANTIGRAVITY_DEFAULT_MODEL = currentSettings.defaultModel.trim();
+    }
+    if (currentSettings.defaultReasoningEffort?.trim()) {
+      env.BB_ANTIGRAVITY_DEFAULT_REASONING = currentSettings.defaultReasoningEffort.trim();
+    }
+    return {
+      displayName: "Google Antigravity",
+      command: "agy_acp_server.par",
+      args: launchArgs,
+      env,
+    };
+  }
 
   // Persist default model settings for the host bridge (host reads this file + env fallback).
   // This keeps per-provider defaults configurable via BB Settings UI, aligning with other provider plugins.
@@ -65,77 +84,69 @@ export default async function plugin(bb: BbPluginApi) {
     } catch {}
   }
   writeSettingsCache(saved);
-  settings.onChange((next) => writeSettingsCache(next));
 
-  // Launch args come from the ACP registry (mirrored in FALLBACK_DIST): the
-  // registry specifies `--uid=` for linux-x86_64/linux-aarch64 only. The
-  // launch spec is registered server-side, so platform resolution uses the
-  // server's own platform — the common case where bb runs on the same machine
-  // that launches the agent. Installs record the per-platform args in their
-  // manifest too.
-  const launchArgs = FALLBACK_DIST[detectTarget().distKey]?.args ?? [];
+  let providerRegistration: { dispose: () => void } | null = null;
 
-  // Immutable launch facts for the ACP server process.
-  const LAUNCH = {
-    displayName: "Google Antigravity",
-    // Found on PATH (install to ~/.local/bin or equivalent). Health probes use
-    // `which`; an absolute path also works.
-    command: "agy_acp_server.par",
-    args: launchArgs,
-    // Env stays empty on purpose: the ACP server resolves its sandbox helper
-    // `localharness_external` from PATH, and `bb google-antigravity-acp
-    // install` links both the server binary and the helper into binDir on
-    // every machine. A single baked-in ANTIGRAVITY_HARNESS_PATH value would
-    // be wrong on every other machine (settings are shared across hosts).
-    env: {} as Record<string, string>,
-  };
+  function registerProvider(currentSettings: typeof saved) {
+    if (providerRegistration) {
+      providerRegistration.dispose();
+    }
+    const launch = buildLaunchSpec(currentSettings);
+    providerRegistration = bb.providers.register({
+      id: PROVIDER_ID,
+      displayName: "Google Antigravity",
+      family: "acp",
+      icon: "./icons/google-antigravity.svg",
+      strings: {
+        // The Antigravity server authenticates in-band (ACP auth requests):
+        // oauth-personal (Google account), oauth-business (Gemini Enterprise),
+        // gemini-api-key, or agent-platform (ADC/API key).
+        signInHint:
+          "Open a Google Antigravity thread and follow the login prompt (Google account, Gemini API key, or Agent Platform).",
+        expiredHint:
+          "Your Google Antigravity session expired. Start a thread and re-authenticate in the login prompt.",
+        installUrl: "https://antigravity.google/docs/ide/extensions/zed",
+        iconTint: { light: "#4285F4", dark: "#8AB4F8" },
+      },
+      serviceTiers: [
+        { id: "default", label: "Default" },
+        { id: "fast", label: "Fast" },
+      ],
+      // Only listed on hosts where the ACP server binary is installed and the
+      // bridge health probe passes.
+      experimental_visibility: "installed",
+      // Every ACP agent answers model/list from its own account/agent state, so
+      // one probe per machine serves every workspace on it.
+      models: { scope: "host" },
+      maintenance: { health: true, usage: false, installation: false },
+      capabilities: {
+        supportsServiceTier: true,
+        supportsNativeUserQuestion: false,
+        supportsManualCompaction: false,
+        supportsThreadArchive: false,
+        supportsThreadRename: false,
+        // agy_acp_server.par advertises sessionCapabilities {list, resume}; no
+        // session/fork.
+        fork: "none",
+        permissionModes: ["accept-edits", "full"],
+        reasoningLevels: ["low", "medium", "high", "xhigh", "max", "ultra"],
+      },
+      composerActions: [],
+      experimental_bridgeOptions: {
+        acpLaunchSpec: launch,
+      },
+    });
+  }
+
+  registerProvider(saved);
+
+  settings.onChange((next) => {
+    saved = next;
+    writeSettingsCache(next);
+    registerProvider(next);
+  });
 
   const host = bb.hosts.experimental_client({ contract: agyHostContract });
-
-  bb.providers.register({
-    id: PROVIDER_ID,
-    displayName: "Google Antigravity",
-    family: "acp",
-    icon: "./icons/google-antigravity.svg",
-    strings: {
-      // The Antigravity server authenticates in-band (ACP auth requests):
-      // oauth-personal (Google account), oauth-business (Gemini Enterprise),
-      // gemini-api-key, or agent-platform (ADC/API key).
-      signInHint:
-        "Open a Google Antigravity thread and follow the login prompt (Google account, Gemini API key, or Agent Platform).",
-      expiredHint:
-        "Your Google Antigravity session expired. Start a thread and re-authenticate in the login prompt.",
-      installUrl: "https://antigravity.google/docs/ide/extensions/zed",
-      iconTint: { light: "#4285F4", dark: "#8AB4F8" },
-    },
-    serviceTiers: [
-      { id: "default", label: "Default" },
-      { id: "fast", label: "Fast" },
-    ],
-    // Only listed on hosts where the ACP server binary is installed and the
-    // bridge health probe passes.
-    experimental_visibility: "installed",
-    // Every ACP agent answers model/list from its own account/agent state, so
-    // one probe per machine serves every workspace on it.
-    models: { scope: "host" },
-    maintenance: { health: true, usage: false, installation: false },
-    capabilities: {
-      supportsServiceTier: true,
-      supportsNativeUserQuestion: false,
-      supportsManualCompaction: false,
-      supportsThreadArchive: false,
-      supportsThreadRename: false,
-      // agy_acp_server.par advertises sessionCapabilities {list, resume}; no
-      // session/fork.
-      fork: "none",
-      permissionModes: ["accept-edits", "full"],
-      reasoningLevels: ["low", "medium", "high"],
-    },
-    composerActions: [],
-    experimental_bridgeOptions: {
-      acpLaunchSpec: LAUNCH,
-    },
-  });
 
   bb.cli.register({
     name: "google-antigravity-acp",
@@ -182,11 +193,12 @@ export default async function plugin(bb: BbPluginApi) {
     } else {
       probe = await probeLocal();
     }
+    const currentLaunch = buildLaunchSpec(current);
     const status = {
       providerId: PROVIDER_ID,
-      displayName: LAUNCH.displayName,
-      command: LAUNCH.command,
-      launchArgs: LAUNCH.args,
+      displayName: currentLaunch.displayName,
+      command: currentLaunch.command,
+      launchArgs: currentLaunch.args,
       target: target.hostId
         ? `${target.label}${probe.ok ? "" : " (probe failed)"}`
         : target.error ?? "this machine (server)",

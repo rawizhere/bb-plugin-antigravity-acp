@@ -2,9 +2,13 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import {
   normalizeEffort,
+  normalizeModelId,
+  extractVersion,
+  compareVersions,
   parseRawModels,
   resolveRawModelId,
   rawListsEqual,
+  FALLBACK_DEFAULT_VARIANT_ID,
   type RawModel,
 } from "../model-utils.js";
 
@@ -39,6 +43,38 @@ describe("normalizeEffort — generic, no allow-list", () => {
   });
 });
 
+describe("version parsing and latest flash model selection", () => {
+  it("extracts and compares numeric versions", () => {
+    assert.deepEqual(extractVersion("gemini-3.8-flash"), [3, 8]);
+    assert.deepEqual(extractVersion("gemini-3.7-flash"), [3, 7]);
+    assert.deepEqual(extractVersion("gemini-3.6-flash"), [3, 6]);
+    assert.ok(compareVersions([3, 8], [3, 7]) > 0);
+    assert.ok(compareVersions([3, 7], [3, 8]) < 0);
+    assert.ok(compareVersions([3, 7], [3, 7]) === 0);
+  });
+
+  it("selects latest flash model by version descending (3.8 > 3.7 > 3.6)", () => {
+    const { defaultFamilyId, models } = parseRawModels(CURRENT_RAW);
+    assert.equal(defaultFamilyId, "gemini-3.8-flash");
+    const defModel = models.find((m) => m.id === "gemini-3.8-flash")!;
+    assert.ok(defModel.isDefault);
+    assert.equal(defModel.defaultReasoningEffort, "medium");
+  });
+
+  it("automatically promotes newer flash model (e.g. 3.9 or 4.0) to default without code change", () => {
+    const rawWithNewer: RawModel[] = [
+      ...CURRENT_RAW,
+      { id: "gemini-4.0-flash-medium", name: "Gemini 4.0 Flash (Medium)" },
+      { id: "gemini-4.0-flash-high", name: "Gemini 4.0 Flash (High)" },
+    ];
+    const { defaultFamilyId, models } = parseRawModels(rawWithNewer);
+    assert.equal(defaultFamilyId, "gemini-4.0-flash");
+    const m4 = models.find((m) => m.id === "gemini-4.0-flash")!;
+    assert.ok(m4.isDefault);
+    assert.equal(m4.defaultReasoningEffort, "medium");
+  });
+});
+
 describe("parseRawModels — dynamic discovery", () => {
   it("groups current 11 raw models into 4 families", () => {
     const { families, models, defaultFamilyId } = parseRawModels(CURRENT_RAW);
@@ -48,7 +84,7 @@ describe("parseRawModels — dynamic discovery", () => {
     assert.ok(families.has("gemini-3.7-flash"));
     assert.ok(families.has("gemini-3.6-flash"));
     assert.ok(families.has("gemini-3.1-pro"));
-    assert.equal(defaultFamilyId, "gemini-3.7-flash");
+    assert.equal(defaultFamilyId, "gemini-3.8-flash");
   });
 
   it("strips effort from displayName, no double-naming", () => {
@@ -64,7 +100,6 @@ describe("parseRawModels — dynamic discovery", () => {
     // Pro only has low + high (mapped)
     assert.ok(pro.supportedReasoningEfforts.some((e) => e.reasoningEffort === "low"));
     assert.ok(pro.supportedReasoningEfforts.some((e) => e.reasoningEffort === "high"));
-    // medium should be absent or mapped to high fallback — check count
     assert.equal(pro.supportedReasoningEfforts.length, 2);
   });
 
@@ -104,25 +139,32 @@ describe("parseRawModels — dynamic discovery", () => {
     assert.equal(models.find((m) => m.id === "gemini-3.1-pro")!.defaultReasoningEffort, "low");
   });
 
-  it("falls back if preferred default not in catalog", () => {
+  it("falls back to latest flash at medium if preferred default not in catalog", () => {
     const pref = { model: "non-existent", effort: "high" } as const;
     const { defaultFamilyId } = parseRawModels(CURRENT_RAW, undefined, pref);
-    assert.equal(defaultFamilyId, "gemini-3.7-flash");
+    assert.equal(defaultFamilyId, "gemini-3.8-flash");
   });
 });
 
 describe("resolveRawModelId — launch variant resolution (tested via payload, not LLM)", () => {
-  const { families, defaultFamilyId } = parseRawModels(CURRENT_RAW);
+  const catalog = parseRawModels(CURRENT_RAW);
+  const { families, defaultFamilyId } = catalog;
+
   it("resolves family + reasoning to concrete ACP id", () => {
     assert.equal(resolveRawModelId("gemini-3.7-flash", "high", families, defaultFamilyId, CURRENT_RAW), "gemini-3.7-flash-high");
     assert.equal(resolveRawModelId("gemini-3.7-flash", "medium", families, defaultFamilyId, CURRENT_RAW), "gemini-3.7-flash-medium");
     assert.equal(resolveRawModelId("gemini-3.7-flash", "low", families, defaultFamilyId, CURRENT_RAW), "gemini-3.7-flash-low");
   });
 
+  it("supports passing ModelCatalog object directly (clean abstraction)", () => {
+    assert.equal(resolveRawModelId("gemini-3.8-flash", "high", catalog), "gemini-3.8-flash-high");
+    assert.equal(resolveRawModelId("gemini-3.8-flash", "medium", catalog), "gemini-3.8-flash-medium");
+    assert.equal(resolveRawModelId(undefined, undefined, catalog), "gemini-3.8-flash-medium");
+  });
+
   it("resolves gemini-3.1-pro variants (including gemini-pro-agent mapping)", () => {
     assert.equal(resolveRawModelId("gemini-3.1-pro", "high", families, defaultFamilyId, CURRENT_RAW), "gemini-pro-agent");
     assert.equal(resolveRawModelId("gemini-3.1-pro", "low", families, defaultFamilyId, CURRENT_RAW), "gemini-3.1-pro-low");
-    // medium falls back to high variant for pro
     const res = resolveRawModelId("gemini-3.1-pro", "medium", families, defaultFamilyId, CURRENT_RAW);
     assert.ok(["gemini-pro-agent", "gemini-3.1-pro-low"].includes(res));
   });
@@ -132,9 +174,16 @@ describe("resolveRawModelId — launch variant resolution (tested via payload, n
     assert.equal(resolveRawModelId("gemini-pro-agent", undefined, families, defaultFamilyId, CURRENT_RAW), "gemini-pro-agent");
   });
 
-  it("resolves default when model omitted (thread/start with undefined)", () => {
+  it("resolves default latest flash model at medium effort when model omitted", () => {
     const resolved = resolveRawModelId(undefined, undefined, families, defaultFamilyId, CURRENT_RAW);
-    assert.equal(resolved, "gemini-3.7-flash-medium");
+    assert.equal(resolved, "gemini-3.8-flash-medium");
+  });
+
+  it("falls back safely to static default variant when catalog is cold/empty", () => {
+    const emptyCatalog = { families: new Map(), models: [], defaultFamilyId: "", rawModels: [] };
+    const resolved = resolveRawModelId(undefined, undefined, emptyCatalog);
+    assert.equal(resolved, FALLBACK_DEFAULT_VARIANT_ID);
+    assert.equal(resolved, "gemini-3.8-flash-medium");
   });
 
   it("handles future effort generically", () => {
@@ -148,7 +197,6 @@ describe("resolveRawModelId — launch variant resolution (tested via payload, n
   });
 
   it("verifies intercepted payload rather than LLM identity", () => {
-    // Simulate handleLine intercept: ensure we assert on the resolved model id that would be sent to agy_acp_server.par
     const fakeLine = JSON.stringify({
       jsonrpc: "2.0",
       id: 1,
@@ -156,9 +204,8 @@ describe("resolveRawModelId — launch variant resolution (tested via payload, n
       params: { options: { model: "gemini-3.8-flash", reasoningLevel: "high" } },
     });
     const parsed = JSON.parse(fakeLine);
-    const resolved = resolveRawModelId(parsed.params.options.model, parsed.params.options.reasoningLevel, families, defaultFamilyId, CURRENT_RAW);
+    const resolved = resolveRawModelId(parsed.params.options.model, parsed.params.options.reasoningLevel, catalog);
     assert.equal(resolved, "gemini-3.8-flash-high");
-    // This is what we send to the ACP server — deterministic, no LLM hallucination
     parsed.params.options.model = resolved;
     assert.equal(JSON.parse(JSON.stringify(parsed)).params.options.model, "gemini-3.8-flash-high");
   });
@@ -177,8 +224,6 @@ describe("rawListsEqual — staleness detection", () => {
 
 describe("cache staleness — TTL behavior", () => {
   it("cache file includes timestamp and is comparable", () => {
-    // Simulate: save then load should preserve timestamp
-    // This test documents the contract: cache JSON must have {rawModels, timestamp}
     const mockCache = { rawModels: CURRENT_RAW, timestamp: Date.now() };
     assert.ok(typeof mockCache.timestamp === "number");
     assert.ok(Array.isArray(mockCache.rawModels));
