@@ -6,15 +6,17 @@
 // launch facts arrive in `options.providerOptions.acpLaunchSpec` from the
 // server-side registration in server.ts.
 //
-// We wrap the bridge to aggregate Antigravity's raw reasoning variants
-// (e.g. gemini-3.7-flash-high, gemini-3.7-flash-medium, gemini-3.7-flash-low)
-// into clean model families (gemini-3.7-flash with low/medium/high efforts),
-// preventing double naming in the UI and enabling clean agent workflow
-// configurations.
+// We wrap the bridge to dynamically discover Antigravity's model options from
+// the running ACP server (agy_acp_server.par), group reasoning variants into
+// clean model families with supported reasoning efforts, and resolve launch
+// options (model + reasoningLevel) to concrete backend model IDs.
 //
 // The same artifact also implements the plugin's host RPC (`bb
 // google-antigravity-acp install` / `status`), so installs run on the machine
 // where the daemon executes instead of on the bb server.
+import fs from "node:fs";
+import path from "node:path";
+import os from "node:os";
 import { spawn } from "node:child_process";
 import readline from "node:readline";
 import {
@@ -24,8 +26,20 @@ import { experimental_defineHostEntry } from "@get-bb/plugin-sdk/host";
 import { agyHostContract } from "./contract.js";
 import { probeLocal, runInstall } from "./install.js";
 
+interface RawModel {
+  id: string;
+  name: string;
+}
+
+interface ModelFamily {
+  id: string;
+  displayName: string;
+  variants: Map<string, string>; // effort -> rawId
+  defaultEffort: string;
+}
+
 interface AvailableModelReasoningEffort {
-  reasoningEffort: "low" | "medium" | "high";
+  reasoningEffort: string;
   description: string;
 }
 
@@ -35,181 +49,213 @@ interface AvailableModel {
   displayName: string;
   description: string;
   supportedReasoningEfforts: AvailableModelReasoningEffort[];
-  defaultReasoningEffort: "low" | "medium" | "high";
+  defaultReasoningEffort: string;
   isDefault: boolean;
 }
 
-const REASONING_EFFORTS: AvailableModelReasoningEffort[] = [
-  { reasoningEffort: "low", description: "Low reasoning effort" },
-  { reasoningEffort: "medium", description: "Medium reasoning effort" },
-  { reasoningEffort: "high", description: "High reasoning effort" },
-];
+const CACHE_FILE = path.join(
+  os.homedir(),
+  ".bb",
+  "plugins",
+  "google-antigravity-acp",
+  "models-cache.json",
+);
 
-const DEFAULT_MODELS: AvailableModel[] = [
-  {
-    id: "gemini-3.8-flash",
-    model: "gemini-3.8-flash",
-    displayName: "Gemini 3.8 Flash",
-    description: "",
-    supportedReasoningEfforts: REASONING_EFFORTS,
-    defaultReasoningEffort: "medium",
-    isDefault: false,
-  },
-  {
-    id: "gemini-3.7-flash",
-    model: "gemini-3.7-flash",
-    displayName: "Gemini 3.7 Flash",
-    description: "",
-    supportedReasoningEfforts: REASONING_EFFORTS,
-    defaultReasoningEffort: "medium",
-    isDefault: true,
-  },
-  {
-    id: "gemini-3.6-flash",
-    model: "gemini-3.6-flash",
-    displayName: "Gemini 3.6 Flash",
-    description: "",
-    supportedReasoningEfforts: REASONING_EFFORTS,
-    defaultReasoningEffort: "medium",
-    isDefault: false,
-  },
-  {
-    id: "gemini-3.1-pro",
-    model: "gemini-3.1-pro",
-    displayName: "Gemini 3.1 Pro",
-    description: "",
-    supportedReasoningEfforts: REASONING_EFFORTS,
-    defaultReasoningEffort: "medium",
-    isDefault: false,
-  },
-];
+function parseRawModels(rawList: RawModel[]): {
+  families: Map<string, ModelFamily>;
+  models: AvailableModel[];
+  defaultFamilyId: string;
+} {
+  const families = new Map<string, ModelFamily>();
 
-const KNOWN_RAW_MAP: Record<string, Record<string, string>> = {
-  "gemini-3.8-flash": {
-    low: "gemini-3.8-flash-low",
-    medium: "gemini-3.8-flash-medium",
-    high: "gemini-3.8-flash-high",
-  },
-  "gemini-3.7-flash": {
-    low: "gemini-3.7-flash-low",
-    medium: "gemini-3.7-flash-medium",
-    high: "gemini-3.7-flash-high",
-  },
-  "gemini-3.6-flash": {
-    low: "gemini-3.6-flash-low",
-    medium: "gemini-3.6-flash-medium",
-    high: "gemini-3.6-flash-high",
-  },
-  "gemini-3.1-pro": {
-    low: "gemini-3.1-pro-low",
-    medium: "gemini-pro-agent",
-    high: "gemini-pro-agent",
-  },
-  "gemini-pro": {
-    low: "gemini-3.1-pro-low",
-    medium: "gemini-pro-agent",
-    high: "gemini-pro-agent",
-  },
-  "gemini-pro-agent": {
-    low: "gemini-3.1-pro-low",
-    medium: "gemini-pro-agent",
-    high: "gemini-pro-agent",
-  },
-};
+  for (const raw of rawList) {
+    const rawId = raw.id;
+    const rawName = raw.name || rawId;
 
-function cleanDisplayName(name: string): string {
-  return name.replace(/\s*\((?:High|Medium|Low)\)\s*/gi, "").trim();
-}
+    // Detect effort from name: e.g. "Gemini 3.7 Flash (High)"
+    const effortMatch = rawName.match(
+      /^(.*?)\s*\((High|Medium|Low|Low-Medium|None|Off|Min|Max|Default)\)$/i,
+    );
+    let displayName = rawName;
+    let effort = "medium";
 
-function parseRawVariant(id: string, name: string): { familyId: string; effort: "low" | "medium" | "high"; displayName: string } {
-  if (id === "gemini-pro-agent") {
-    return { familyId: "gemini-3.1-pro", effort: "high", displayName: "Gemini 3.1 Pro" };
-  }
-  for (const effort of ["high", "medium", "low"] as const) {
-    if (id.endsWith(`-${effort}`)) {
-      const familyId = id.slice(0, -(effort.length + 1));
-      return { familyId, effort, displayName: cleanDisplayName(name) };
+    if (effortMatch) {
+      displayName = effortMatch[1].trim();
+      effort = effortMatch[2].toLowerCase();
+    } else {
+      const idMatch = rawId.match(/^(.*?)-(low|medium|high)$/i);
+      if (idMatch) {
+        effort = idMatch[2].toLowerCase();
+      }
     }
-  }
-  return { familyId: id, effort: "medium", displayName: cleanDisplayName(name) };
-}
 
-function groupRawModels(rawModels: Array<{ id: string; name: string }>): AvailableModel[] {
-  const families = new Map<
-    string,
-    { id: string; displayName: string; efforts: Set<string>; rawByEffort: Map<string, string> }
-  >();
+    // Derive family slug from displayName (e.g. "Gemini 3.7 Flash" -> "gemini-3.7-flash")
+    const familyId = displayName
+      .toLowerCase()
+      .replace(/[^a-z0-9.]+/g, "-")
+      .replace(/^-+|-+$/g, "");
 
-  for (const raw of rawModels) {
-    const { familyId, effort, displayName } = parseRawVariant(raw.id, raw.name);
-    let entry = families.get(familyId);
-    if (!entry) {
-      entry = {
+    let fam = families.get(familyId);
+    if (!fam) {
+      fam = {
         id: familyId,
         displayName,
-        efforts: new Set(),
-        rawByEffort: new Map(),
+        variants: new Map(),
+        defaultEffort: "medium",
       };
-      families.set(familyId, entry);
+      families.set(familyId, fam);
     }
-    entry.efforts.add(effort);
-    entry.rawByEffort.set(effort, raw.id);
+    fam.variants.set(effort, rawId);
   }
 
-  const ladder = ["low", "medium", "high"] as const;
-  const result: AvailableModel[] = [];
-
-  for (const [id, f] of families) {
-    if (!f.rawByEffort.has("medium") && f.rawByEffort.has("high")) {
-      f.efforts.add("medium");
-      f.rawByEffort.set("medium", f.rawByEffort.get("high")!);
+  // Ensure medium effort is mapped if high exists
+  for (const fam of families.values()) {
+    if (!fam.variants.has("medium") && fam.variants.has("high")) {
+      fam.variants.set("medium", fam.variants.get("high")!);
     }
-    const supportedReasoningEfforts = ladder
-      .filter((lvl) => f.efforts.has(lvl))
-      .map((lvl) => ({
-        reasoningEffort: lvl,
-        description: `${lvl.charAt(0).toUpperCase() + lvl.slice(1)} reasoning effort`,
-      }));
+    if (!fam.variants.has("medium") && fam.variants.size > 0) {
+      fam.defaultEffort = fam.variants.keys().next().value!;
+    }
+  }
 
-    result.push({
-      id,
-      model: id,
-      displayName: f.displayName,
+  // Pick default family: prefer gemini-3.7-flash, else first flash, else first model
+  let defaultFamilyId = "";
+  for (const id of families.keys()) {
+    if (id === "gemini-3.7-flash") {
+      defaultFamilyId = id;
+      break;
+    }
+  }
+  if (!defaultFamilyId) {
+    for (const id of families.keys()) {
+      if (id.includes("flash")) {
+        defaultFamilyId = id;
+        break;
+      }
+    }
+  }
+  if (!defaultFamilyId && families.size > 0) {
+    defaultFamilyId = families.keys().next().value!;
+  }
+
+  const standardLadder = ["low", "medium", "high"];
+  const models: AvailableModel[] = [];
+
+  for (const fam of families.values()) {
+    // Collect reasoning efforts preserving standard order where possible
+    const efforts = standardLadder.filter((eff) => fam.variants.has(eff));
+    for (const eff of fam.variants.keys()) {
+      if (!efforts.includes(eff)) efforts.push(eff);
+    }
+
+    const supportedReasoningEfforts: AvailableModelReasoningEffort[] = efforts.map(
+      (eff) => ({
+        reasoningEffort: eff,
+        description: `${eff.charAt(0).toUpperCase() + eff.slice(1)} reasoning effort`,
+      }),
+    );
+
+    models.push({
+      id: fam.id,
+      model: fam.id,
+      displayName: fam.displayName,
       description: "",
       supportedReasoningEfforts,
-      defaultReasoningEffort: "medium",
-      isDefault: id === "gemini-3.7-flash",
+      defaultReasoningEffort: fam.defaultEffort,
+      isDefault: fam.id === defaultFamilyId,
     });
   }
 
-  return result.length > 0 ? result : DEFAULT_MODELS;
+  return { families, models, defaultFamilyId };
 }
 
-function resolveRawModelId(model: string, reasoningLevel?: string): string {
-  const family = KNOWN_RAW_MAP[model];
-  if (family) {
-    const level = reasoningLevel === "low" || reasoningLevel === "high" ? reasoningLevel : "medium";
-    return family[level] ?? family.medium;
+function resolveRawModelId(
+  model: string | undefined,
+  reasoningLevel: string | undefined,
+  families: Map<string, ModelFamily>,
+  defaultFamilyId: string,
+  rawModels: RawModel[],
+): string {
+  // If model is omitted or empty, use the catalog default model family
+  const targetModel = model && model.trim() ? model.trim() : defaultFamilyId;
+
+  // Check if it already directly matches any raw model id
+  const rawHit = rawModels.find((r) => r.id === targetModel);
+  if (rawHit) {
+    return targetModel;
   }
-  // If model name is already a concrete variant ending in -low, -medium, -high, or gemini-pro-agent
-  if (model.endsWith("-low") || model.endsWith("-medium") || model.endsWith("-high") || model === "gemini-pro-agent") {
-    return model;
+
+  // Check if targetModel matches a discovered family
+  const fam = families.get(targetModel);
+  if (fam) {
+    const effort = (reasoningLevel ?? fam.defaultEffort ?? "medium").toLowerCase();
+    const variant = fam.variants.get(effort);
+    if (variant) return variant;
+    // Fallback: medium, then high, then first available variant
+    return (
+      fam.variants.get("medium") ??
+      fam.variants.get("high") ??
+      fam.variants.values().next().value ??
+      targetModel
+    );
   }
-  if (model.startsWith("gemini-")) {
-    const level = reasoningLevel === "low" || reasoningLevel === "high" ? reasoningLevel : "medium";
-    return `${model}-${level}`;
+
+  // If model name is already a concrete variant with a known effort suffix
+  if (
+    targetModel.endsWith("-low") ||
+    targetModel.endsWith("-medium") ||
+    targetModel.endsWith("-high") ||
+    targetModel === "gemini-pro-agent"
+  ) {
+    return targetModel;
   }
-  return model;
+
+  // Generic fallback if unknown model
+  if (reasoningLevel) {
+    return `${targetModel}-${reasoningLevel.toLowerCase()}`;
+  }
+  return targetModel;
 }
 
-let cachedModels: AvailableModel[] = DEFAULT_MODELS;
-let discoveryPromise: Promise<AvailableModel[]> | null = null;
+// ---- Discovery and caching ------------------------------------------------
 
-async function queryAcpModels(
+let activeRawModels: RawModel[] = [];
+let activeFamilies = new Map<string, ModelFamily>();
+let activeModels: AvailableModel[] = [];
+let activeDefaultFamilyId = "";
+let isInitialized = false;
+let discoveryPromise: Promise<void> | null = null;
+
+function loadFromDiskCache(): boolean {
+  try {
+    if (fs.existsSync(CACHE_FILE)) {
+      const data = JSON.parse(fs.readFileSync(CACHE_FILE, "utf8"));
+      if (Array.isArray(data.rawModels) && data.rawModels.length > 0) {
+        activeRawModels = data.rawModels;
+        const parsed = parseRawModels(activeRawModels);
+        activeFamilies = parsed.families;
+        activeModels = parsed.models;
+        activeDefaultFamilyId = parsed.defaultFamilyId;
+        isInitialized = true;
+        return true;
+      }
+    }
+  } catch {}
+  return false;
+}
+
+function saveToDiskCache(rawModels: RawModel[]) {
+  try {
+    fs.mkdirSync(path.dirname(CACHE_FILE), { recursive: true });
+    fs.writeFileSync(CACHE_FILE, JSON.stringify({ rawModels, timestamp: Date.now() }), "utf8");
+  } catch {}
+}
+
+async function queryAcpServer(
   command: string,
   args: string[],
   env: Record<string, string>,
-): Promise<Array<{ id: string; name: string }>> {
+): Promise<RawModel[]> {
   return new Promise((resolve, reject) => {
     const proc = spawn(command, args, {
       env: { ...process.env, ...env },
@@ -222,8 +268,8 @@ async function queryAcpModels(
 
     const timeout = setTimeout(() => {
       proc.kill();
-      reject(new Error("ACP model query timed out"));
-    }, 5000);
+      reject(new Error("ACP server query timed out"));
+    }, 15000);
 
     rl.on("line", (line) => {
       try {
@@ -234,9 +280,7 @@ async function queryAcpModels(
           if (msg.error) entry.reject(new Error(msg.error.message));
           else entry.resolve(msg.result);
         }
-      } catch {
-        // ignore
-      }
+      } catch {}
     });
 
     function send(method: string, params: any) {
@@ -256,13 +300,13 @@ async function queryAcpModels(
         });
         const session: any = await send("session/new", { cwd: process.cwd(), mcpServers: [] });
         const modelOption = session?.configOptions?.find((c: any) => c.id === "model");
-        const rawModels = (modelOption?.options ?? []).map((o: any) => ({
+        const rawList = (modelOption?.options ?? []).map((o: any) => ({
           id: o.value,
           name: o.name ?? o.value,
         }));
         clearTimeout(timeout);
         proc.kill();
-        resolve(rawModels);
+        resolve(rawList);
       } catch (err) {
         clearTimeout(timeout);
         proc.kill();
@@ -272,20 +316,34 @@ async function queryAcpModels(
   });
 }
 
-function refreshModelsInBackground(launchSpec?: { command: string; args: string[]; env: Record<string, string> }) {
-  if (discoveryPromise || !launchSpec?.command) return;
-  discoveryPromise = queryAcpModels(launchSpec.command, launchSpec.args ?? [], launchSpec.env ?? {})
-    .then((raw) => {
-      if (raw && raw.length > 0) {
-        cachedModels = groupRawModels(raw);
+async function refreshModels(launchSpec?: { command: string; args: string[]; env: Record<string, string> }) {
+  if (discoveryPromise) return discoveryPromise;
+  const cmd = launchSpec?.command || "agy_acp_server.par";
+  const args = launchSpec?.args || [];
+  const env = launchSpec?.env || {};
+
+  discoveryPromise = queryAcpServer(cmd, args, env)
+    .then((rawList) => {
+      if (rawList && rawList.length > 0) {
+        activeRawModels = rawList;
+        const parsed = parseRawModels(activeRawModels);
+        activeFamilies = parsed.families;
+        activeModels = parsed.models;
+        activeDefaultFamilyId = parsed.defaultFamilyId;
+        isInitialized = true;
+        saveToDiskCache(rawList);
       }
-      return cachedModels;
     })
-    .catch(() => cachedModels)
+    .catch(() => {})
     .finally(() => {
       discoveryPromise = null;
     });
+
+  return discoveryPromise;
 }
+
+// Attempt initial load from disk cache
+loadFromDiskCache();
 
 export const experimental_providerBridge = {
   experimental_apiVersion: 1 as const,
@@ -295,13 +353,20 @@ export const experimental_providerBridge = {
       if (parsed && typeof parsed === "object") {
         if (parsed.method === "model/list") {
           const launchSpec = parsed.params?.providerOptions?.acpLaunchSpec;
-          refreshModelsInBackground(launchSpec);
+          if (!isInitialized) {
+            // Await discovery if not yet loaded
+            await refreshModels(launchSpec);
+          } else {
+            // Trigger background refresh if already loaded
+            refreshModels(launchSpec);
+          }
+
           process.stdout.write(
             JSON.stringify({
               jsonrpc: "2.0",
               id: parsed.id,
               result: {
-                models: cachedModels,
+                models: activeModels,
                 selectedOnlyModels: [],
               },
             }) + "\n",
@@ -310,14 +375,22 @@ export const experimental_providerBridge = {
         }
 
         if (
-          (parsed.method === "thread/start" ||
-            parsed.method === "thread/resume" ||
-            parsed.method === "thread/fork") &&
-          parsed.params?.options?.model
+          parsed.method === "thread/start" ||
+          parsed.method === "thread/resume" ||
+          parsed.method === "thread/fork"
         ) {
+          if (!parsed.params.options) {
+            parsed.params.options = {};
+          }
+          if (!isInitialized) {
+            loadFromDiskCache();
+          }
           const resolved = resolveRawModelId(
             parsed.params.options.model,
             parsed.params.options.reasoningLevel,
+            activeFamilies,
+            activeDefaultFamilyId,
+            activeRawModels,
           );
           parsed.params.options.model = resolved;
           line = JSON.stringify(parsed);
