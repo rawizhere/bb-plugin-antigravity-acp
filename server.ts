@@ -6,6 +6,9 @@
 // agents). Everything agent-specific the bridge needs travels in
 // `experimental_bridgeOptions.acpLaunchSpec`; the bridge itself is the
 // canonical ACP bridge shipped in host.ts.
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { type BbPluginApi, type PluginCliContext } from "@get-bb/plugin-sdk";
 import { agyHostContract } from "./contract.js";
 import { FALLBACK_DIST, detectTarget, probeLocal, runInstall, type InstallResult } from "./install.js";
@@ -31,8 +34,38 @@ export default async function plugin(bb: BbPluginApi) {
       description: "Symlinks to the server binary and its sandbox helper go here.",
       default: "~/.local/bin",
     },
+    defaultModel: {
+      type: "string",
+      label: "Default model family",
+      description:
+        "Preferred default model family (e.g. gemini-3.7-flash, gemini-3.1-pro). Leave empty to auto-select (prefers gemini-3.7-flash). Aligns with BB's per-provider default pattern.",
+      default: "",
+    },
+    defaultReasoningEffort: {
+      type: "string",
+      label: "Default reasoning effort",
+      description:
+        "Preferred reasoning effort for the default model (e.g. low, medium, high). Leave empty to use the model's own default.",
+      default: "",
+    },
   });
   const saved = await settings.get();
+
+  // Persist default model settings for the host bridge (host reads this file + env fallback).
+  // This keeps per-provider defaults configurable via BB Settings UI, aligning with other provider plugins.
+  function writeSettingsCache(vals: typeof saved) {
+    try {
+      const dir = path.join(os.homedir(), ".bb", "plugins", "google-antigravity-acp");
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(
+        path.join(dir, "settings-cache.json"),
+        JSON.stringify({ defaultModel: vals.defaultModel ?? "", defaultReasoningEffort: vals.defaultReasoningEffort ?? "", updatedAt: Date.now() }),
+        "utf8",
+      );
+    } catch {}
+  }
+  writeSettingsCache(saved);
+  settings.onChange((next) => writeSettingsCache(next));
 
   // Launch args come from the ACP registry (mirrored in FALLBACK_DIST): the
   // registry specifies `--uid=` for linux-x86_64/linux-aarch64 only. The

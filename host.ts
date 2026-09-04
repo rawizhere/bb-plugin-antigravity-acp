@@ -26,32 +26,21 @@ import { experimental_defineHostEntry } from "@get-bb/plugin-sdk/host";
 import { agyHostContract } from "./contract.js";
 import { probeLocal, runInstall } from "./install.js";
 
-interface RawModel {
-  id: string;
-  name: string;
-}
+import {
+  normalizeEffort as _normalizeEffort,
+  parseRawModels as _parseRawModels,
+  resolveRawModelId as _resolveRawModelId,
+  rawListsEqual as _rawListsEqual,
+  type RawModel,
+  type ModelFamily,
+  type AvailableModel,
+} from "./model-utils.js";
 
-interface ModelFamily {
-  id: string;
-  displayName: string;
-  variants: Map<string, string>; // effort -> rawId
-  defaultEffort: string;
-}
-
-interface AvailableModelReasoningEffort {
-  reasoningEffort: string;
-  description: string;
-}
-
-interface AvailableModel {
-  id: string;
-  model: string;
-  displayName: string;
-  description: string;
-  supportedReasoningEfforts: AvailableModelReasoningEffort[];
-  defaultReasoningEffort: string;
-  isDefault: boolean;
-}
+// Re-export pure utils for tests and backward compat
+export const normalizeEffort = _normalizeEffort;
+export const parseRawModels = _parseRawModels;
+export const resolveRawModelId = _resolveRawModelId;
+export const rawListsEqual = _rawListsEqual;
 
 const CACHE_FILE = path.join(
   os.homedir(),
@@ -61,160 +50,36 @@ const CACHE_FILE = path.join(
   "models-cache.json",
 );
 
-function parseRawModels(rawList: RawModel[]): {
-  families: Map<string, ModelFamily>;
-  models: AvailableModel[];
-  defaultFamilyId: string;
-} {
-  const families = new Map<string, ModelFamily>();
+const CACHE_TTL_MS = 6 * 60 * 60 * 1000; // 6h — picker never stale, background refresh handles rotation
 
-  for (const raw of rawList) {
-    const rawId = raw.id;
-    const rawName = raw.name || rawId;
+// ---------------------------------------------------------------------------
+// Per-provider default configurability (BB settings pattern)
+// ---------------------------------------------------------------------------
 
-    // Detect effort from name: e.g. "Gemini 3.7 Flash (High)"
-    const effortMatch = rawName.match(
-      /^(.*?)\s*\((High|Medium|Low|Low-Medium|None|Off|Min|Max|Default)\)$/i,
-    );
-    let displayName = rawName;
-    let effort = "medium";
-
-    if (effortMatch) {
-      displayName = effortMatch[1].trim();
-      effort = effortMatch[2].toLowerCase();
-    } else {
-      const idMatch = rawId.match(/^(.*?)-(low|medium|high)$/i);
-      if (idMatch) {
-        effort = idMatch[2].toLowerCase();
+function getPreferredDefault(): { model: string; effort: string } | null {
+  try {
+    const p = path.join(os.homedir(), ".bb", "plugins", "google-antigravity-acp", "settings-cache.json");
+    if (fs.existsSync(p)) {
+      const j = JSON.parse(fs.readFileSync(p, "utf8"));
+      if (j.defaultModel && typeof j.defaultModel === "string" && j.defaultModel.trim()) {
+        return {
+          model: j.defaultModel.trim().toLowerCase().replace(/[^a-z0-9.]+/g, "-").replace(/^-+|-+$/g, ""),
+          effort: _normalizeEffort(j.defaultReasoningEffort || "medium"),
+        };
       }
     }
-
-    // Derive family slug from displayName (e.g. "Gemini 3.7 Flash" -> "gemini-3.7-flash")
-    const familyId = displayName
-      .toLowerCase()
-      .replace(/[^a-z0-9.]+/g, "-")
-      .replace(/^-+|-+$/g, "");
-
-    let fam = families.get(familyId);
-    if (!fam) {
-      fam = {
-        id: familyId,
-        displayName,
-        variants: new Map(),
-        defaultEffort: "medium",
-      };
-      families.set(familyId, fam);
-    }
-    fam.variants.set(effort, rawId);
+  } catch {}
+  const envModel = process.env.BB_ANTIGRAVITY_DEFAULT_MODEL;
+  if (envModel && envModel.trim()) {
+    return { model: envModel.trim().toLowerCase().replace(/[^a-z0-9.]+/g, "-").replace(/^-+|-+$/g, ""), effort: _normalizeEffort(process.env.BB_ANTIGRAVITY_DEFAULT_REASONING || "medium") };
   }
-
-  // Ensure medium effort is mapped if high exists
-  for (const fam of families.values()) {
-    if (!fam.variants.has("medium") && fam.variants.has("high")) {
-      fam.variants.set("medium", fam.variants.get("high")!);
-    }
-    if (!fam.variants.has("medium") && fam.variants.size > 0) {
-      fam.defaultEffort = fam.variants.keys().next().value!;
-    }
-  }
-
-  // Pick default family: prefer gemini-3.7-flash, else first flash, else first model
-  let defaultFamilyId = "";
-  for (const id of families.keys()) {
-    if (id === "gemini-3.7-flash") {
-      defaultFamilyId = id;
-      break;
-    }
-  }
-  if (!defaultFamilyId) {
-    for (const id of families.keys()) {
-      if (id.includes("flash")) {
-        defaultFamilyId = id;
-        break;
-      }
-    }
-  }
-  if (!defaultFamilyId && families.size > 0) {
-    defaultFamilyId = families.keys().next().value!;
-  }
-
-  const standardLadder = ["low", "medium", "high"];
-  const models: AvailableModel[] = [];
-
-  for (const fam of families.values()) {
-    // Collect reasoning efforts preserving standard order where possible
-    const efforts = standardLadder.filter((eff) => fam.variants.has(eff));
-    for (const eff of fam.variants.keys()) {
-      if (!efforts.includes(eff)) efforts.push(eff);
-    }
-
-    const supportedReasoningEfforts: AvailableModelReasoningEffort[] = efforts.map(
-      (eff) => ({
-        reasoningEffort: eff,
-        description: `${eff.charAt(0).toUpperCase() + eff.slice(1)} reasoning effort`,
-      }),
-    );
-
-    models.push({
-      id: fam.id,
-      model: fam.id,
-      displayName: fam.displayName,
-      description: "",
-      supportedReasoningEfforts,
-      defaultReasoningEffort: fam.defaultEffort,
-      isDefault: fam.id === defaultFamilyId,
-    });
-  }
-
-  return { families, models, defaultFamilyId };
+  return null;
 }
 
-function resolveRawModelId(
-  model: string | undefined,
-  reasoningLevel: string | undefined,
-  families: Map<string, ModelFamily>,
-  defaultFamilyId: string,
-  rawModels: RawModel[],
-): string {
-  // If model is omitted or empty, use the catalog default model family
-  const targetModel = model && model.trim() ? model.trim() : defaultFamilyId;
-
-  // Check if it already directly matches any raw model id
-  const rawHit = rawModels.find((r) => r.id === targetModel);
-  if (rawHit) {
-    return targetModel;
-  }
-
-  // Check if targetModel matches a discovered family
-  const fam = families.get(targetModel);
-  if (fam) {
-    const effort = (reasoningLevel ?? fam.defaultEffort ?? "medium").toLowerCase();
-    const variant = fam.variants.get(effort);
-    if (variant) return variant;
-    // Fallback: medium, then high, then first available variant
-    return (
-      fam.variants.get("medium") ??
-      fam.variants.get("high") ??
-      fam.variants.values().next().value ??
-      targetModel
-    );
-  }
-
-  // If model name is already a concrete variant with a known effort suffix
-  if (
-    targetModel.endsWith("-low") ||
-    targetModel.endsWith("-medium") ||
-    targetModel.endsWith("-high") ||
-    targetModel === "gemini-pro-agent"
-  ) {
-    return targetModel;
-  }
-
-  // Generic fallback if unknown model
-  if (reasoningLevel) {
-    return `${targetModel}-${reasoningLevel.toLowerCase()}`;
-  }
-  return targetModel;
+// Wrap parse to inject settings without changing pure util signature
+function parseWithSettings(rawList: RawModel[]) {
+  const pref = getPreferredDefault();
+  return _parseRawModels(rawList, undefined, pref);
 }
 
 // ---- Discovery and caching ------------------------------------------------
@@ -225,6 +90,13 @@ let activeModels: AvailableModel[] = [];
 let activeDefaultFamilyId = "";
 let isInitialized = false;
 let discoveryPromise: Promise<void> | null = null;
+let cacheTimestamp = 0;
+let lastRefreshAt = 0;
+
+function isCacheStale(): boolean {
+  if (!cacheTimestamp) return true;
+  return Date.now() - cacheTimestamp > CACHE_TTL_MS;
+}
 
 function loadFromDiskCache(): boolean {
   try {
@@ -232,11 +104,13 @@ function loadFromDiskCache(): boolean {
       const data = JSON.parse(fs.readFileSync(CACHE_FILE, "utf8"));
       if (Array.isArray(data.rawModels) && data.rawModels.length > 0) {
         activeRawModels = data.rawModels;
-        const parsed = parseRawModels(activeRawModels);
+        cacheTimestamp = typeof data.timestamp === "number" ? data.timestamp : 0;
+        const parsed = parseWithSettings(activeRawModels);
         activeFamilies = parsed.families;
         activeModels = parsed.models;
         activeDefaultFamilyId = parsed.defaultFamilyId;
         isInitialized = true;
+        lastRefreshAt = cacheTimestamp || Date.now();
         return true;
       }
     }
@@ -247,7 +121,8 @@ function loadFromDiskCache(): boolean {
 function saveToDiskCache(rawModels: RawModel[]) {
   try {
     fs.mkdirSync(path.dirname(CACHE_FILE), { recursive: true });
-    fs.writeFileSync(CACHE_FILE, JSON.stringify({ rawModels, timestamp: Date.now() }), "utf8");
+    cacheTimestamp = Date.now();
+    fs.writeFileSync(CACHE_FILE, JSON.stringify({ rawModels, timestamp: cacheTimestamp }), "utf8");
   } catch {}
 }
 
@@ -325,13 +200,25 @@ async function refreshModels(launchSpec?: { command: string; args: string[]; env
   discoveryPromise = queryAcpServer(cmd, args, env)
     .then((rawList) => {
       if (rawList && rawList.length > 0) {
-        activeRawModels = rawList;
-        const parsed = parseRawModels(activeRawModels);
-        activeFamilies = parsed.families;
-        activeModels = parsed.models;
-        activeDefaultFamilyId = parsed.defaultFamilyId;
-        isInitialized = true;
-        saveToDiskCache(rawList);
+        // Stale check: diff against current cache — handles added/deprecated models so picker never stale
+        if (!isInitialized || !_rawListsEqual(rawList, activeRawModels)) {
+          activeRawModels = rawList;
+          const parsed = parseWithSettings(activeRawModels);
+          activeFamilies = parsed.families;
+          activeModels = parsed.models;
+          activeDefaultFamilyId = parsed.defaultFamilyId;
+          isInitialized = true;
+          saveToDiskCache(rawList);
+        } else {
+          // No change — just bump timestamp to avoid re-querying
+          cacheTimestamp = Date.now();
+          try {
+            const data = JSON.parse(fs.readFileSync(CACHE_FILE, "utf8"));
+            data.timestamp = cacheTimestamp;
+            fs.writeFileSync(CACHE_FILE, JSON.stringify(data), "utf8");
+          } catch {}
+        }
+        lastRefreshAt = Date.now();
       }
     })
     .catch(() => {})
@@ -353,12 +240,19 @@ export const experimental_providerBridge = {
       if (parsed && typeof parsed === "object") {
         if (parsed.method === "model/list") {
           const launchSpec = parsed.params?.providerOptions?.acpLaunchSpec;
-          if (!isInitialized) {
-            // Await discovery if not yet loaded
+          if (!isInitialized || isCacheStale()) {
+            // Stale or cold — await discovery so first picker is fresh
             await refreshModels(launchSpec);
           } else {
-            // Trigger background refresh if already loaded
-            refreshModels(launchSpec);
+            // Re-derive from cache to honor current defaultModel setting (no cache invalidation needed)
+            const reparsed = parseWithSettings(activeRawModels);
+            activeFamilies = reparsed.families;
+            activeModels = reparsed.models;
+            activeDefaultFamilyId = reparsed.defaultFamilyId;
+            if (Date.now() - lastRefreshAt > 60_000) {
+              // Background refresh (debounced 60s) to pick up added/deprecated models without blocking
+              refreshModels(launchSpec);
+            }
           }
 
           process.stdout.write(
