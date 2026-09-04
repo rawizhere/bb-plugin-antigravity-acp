@@ -96,7 +96,7 @@ export default async function plugin(bb: BbPluginApi) {
       // session/fork.
       fork: "none",
       permissionModes: ["accept-edits", "full"],
-      reasoningLevels: ["low", "medium", "high", "xhigh", "max"],
+      reasoningLevels: ["low", "medium", "high"],
     },
     composerActions: [],
     experimental_bridgeOptions: {
