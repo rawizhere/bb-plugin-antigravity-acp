@@ -95,7 +95,7 @@ export default async function plugin(bb: BbPluginApi) {
       // session/fork.
       fork: "none",
       permissionModes: ["accept-edits", "full"],
-      reasoningLevels: ["medium"],
+      reasoningLevels: ["low", "medium", "high"],
     },
     composerActions: [],
     experimental_nativeSkillRoots: {
