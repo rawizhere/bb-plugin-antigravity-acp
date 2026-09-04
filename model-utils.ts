@@ -28,6 +28,25 @@ export interface AvailableModel {
   isDefault: boolean;
 }
 
+export interface ModelCatalog {
+  families: Map<string, ModelFamily>;
+  models: AvailableModel[];
+  defaultFamilyId: string;
+  rawModels: RawModel[];
+}
+
+export const FALLBACK_DEFAULT_MODEL_ID = "gemini-3.8-flash";
+export const FALLBACK_DEFAULT_VARIANT_ID = "gemini-3.8-flash-medium";
+
+export function normalizeModelId(id: string): string {
+  return id
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9.]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .replace(/-+/g, "-");
+}
+
 export function normalizeEffort(raw: string): string {
   return raw
     .trim()
@@ -44,15 +63,27 @@ export function prettyEffort(effort: string): string {
     .join("-");
 }
 
+export function extractVersion(id: string): number[] {
+  const match = id.match(/(\d+(?:\.\d+)*)/);
+  if (!match) return [0];
+  return match[1].split(".").map((n) => parseInt(n, 10) || 0);
+}
+
+export function compareVersions(a: number[], b: number[]): number {
+  const len = Math.max(a.length, b.length);
+  for (let i = 0; i < len; i++) {
+    const va = a[i] ?? 0;
+    const vb = b[i] ?? 0;
+    if (va !== vb) return va - vb;
+  }
+  return 0;
+}
+
 export function parseRawModels(
   rawList: RawModel[],
   preferredDefaultId?: string,
   preferredFromSettings?: { model: string; effort: string } | null,
-): {
-  families: Map<string, ModelFamily>;
-  models: AvailableModel[];
-  defaultFamilyId: string;
-} {
+): ModelCatalog {
   const families = new Map<string, ModelFamily>();
 
   for (const raw of rawList) {
@@ -81,11 +112,7 @@ export function parseRawModels(
       }
     }
 
-    const familyId = displayName
-      .toLowerCase()
-      .replace(/[^a-z0-9.]+/g, "-")
-      .replace(/^-+|-+$/g, "")
-      .replace(/-+/g, "-");
+    const familyId = normalizeModelId(displayName);
 
     let fam = families.get(familyId);
     if (!fam) {
@@ -101,6 +128,7 @@ export function parseRawModels(
     if (fam.variants.size === 1) fam.defaultEffort = effort;
   }
 
+  // Ensure default effort is medium if available, or first available variant
   for (const fam of families.values()) {
     if (fam.variants.has("medium")) {
       fam.defaultEffort = "medium";
@@ -110,9 +138,7 @@ export function parseRawModels(
   }
 
   let defaultFamilyId = "";
-  const preferredModelId = preferredDefaultId
-    ? preferredDefaultId.toLowerCase().replace(/[^a-z0-9.]+/g, "-").replace(/^-+|-+$/g, "")
-    : "";
+  const preferredModelId = preferredDefaultId ? normalizeModelId(preferredDefaultId) : "";
   if (preferredModelId && families.has(preferredModelId)) {
     defaultFamilyId = preferredModelId;
   }
@@ -120,12 +146,26 @@ export function parseRawModels(
     defaultFamilyId = preferredFromSettings.model;
   }
   if (!defaultFamilyId) {
-    for (const id of families.keys()) if (id === "gemini-3.7-flash") { defaultFamilyId = id; break; }
+    // 1. Fallback: Latest Flash model (highest version number containing "flash")
+    const flashFamilies = [...families.keys()]
+      .filter((id) => id.includes("flash"))
+      .sort((a, b) => compareVersions(extractVersion(b), extractVersion(a)));
+
+    if (flashFamilies.length > 0) {
+      defaultFamilyId = flashFamilies[0];
+    }
   }
   if (!defaultFamilyId) {
-    for (const id of families.keys()) if (id.includes("flash")) { defaultFamilyId = id; break; }
+    // 2. Fallback: Highest version model overall
+    const sortedFamilies = [...families.keys()]
+      .sort((a, b) => compareVersions(extractVersion(b), extractVersion(a)));
+    if (sortedFamilies.length > 0) {
+      defaultFamilyId = sortedFamilies[0];
+    }
   }
-  if (!defaultFamilyId && families.size > 0) defaultFamilyId = families.keys().next().value! as string;
+  if (!defaultFamilyId && families.size > 0) {
+    defaultFamilyId = families.keys().next().value! as string;
+  }
 
   const standardLadder = ["low", "medium", "high"];
   const models: AvailableModel[] = [];
@@ -156,28 +196,51 @@ export function parseRawModels(
     });
   }
 
-  return { families, models, defaultFamilyId };
+  return { families, models, defaultFamilyId, rawModels: rawList };
 }
 
 export function resolveRawModelId(
   model: string | undefined,
   reasoningLevel: string | undefined,
-  families: Map<string, ModelFamily>,
-  defaultFamilyId: string,
-  rawModels: RawModel[],
+  familiesOrCatalog: Map<string, ModelFamily> | ModelCatalog,
+  defaultFamilyId?: string,
+  rawModels?: RawModel[],
 ): string {
-  const targetModel = model && model.trim() ? model.trim().toLowerCase().replace(/\s+/g, "-") : defaultFamilyId;
+  let families: Map<string, ModelFamily>;
+  let defFamId: string;
+  let rawList: RawModel[];
 
-  const rawHit = rawModels.find((r) => r.id.toLowerCase() === targetModel.toLowerCase());
+  if ("families" in familiesOrCatalog) {
+    families = familiesOrCatalog.families;
+    defFamId = familiesOrCatalog.defaultFamilyId;
+    rawList = familiesOrCatalog.rawModels;
+  } else {
+    families = familiesOrCatalog;
+    defFamId = defaultFamilyId ?? "";
+    rawList = rawModels ?? [];
+  }
+
+  const cleanModel = model && model.trim() ? normalizeModelId(model) : "";
+  const targetModel = cleanModel || defFamId || FALLBACK_DEFAULT_MODEL_ID;
+
+  const rawHit = rawList.find((r) => r.id.toLowerCase() === targetModel.toLowerCase());
   if (rawHit) return rawHit.id;
 
   let fam: ModelFamily | undefined;
-  for (const [k, v] of families.entries()) if (k.toLowerCase() === targetModel.toLowerCase()) { fam = v; break; }
+  for (const [k, v] of families.entries()) {
+    if (k.toLowerCase() === targetModel.toLowerCase()) {
+      fam = v;
+      break;
+    }
+  }
+
   if (fam) {
     const effort = normalizeEffort(reasoningLevel ?? fam.defaultEffort ?? "medium");
     const variant = fam.variants.get(effort);
     if (variant) return variant;
-    for (const [k, v] of fam.variants.entries()) if (normalizeEffort(k) === effort) return v;
+    for (const [k, v] of fam.variants.entries()) {
+      if (normalizeEffort(k) === effort) return v;
+    }
     return fam.variants.get("medium") ?? fam.variants.values().next().value ?? targetModel;
   }
 
@@ -191,6 +254,7 @@ export function resolveRawModelId(
   }
 
   if (reasoningLevel) return `${targetModel}-${normalizeEffort(reasoningLevel)}`;
+  if (!cleanModel && !defFamId) return FALLBACK_DEFAULT_VARIANT_ID;
   return targetModel;
 }
 

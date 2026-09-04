@@ -27,20 +27,25 @@ import { agyHostContract } from "./contract.js";
 import { probeLocal, runInstall } from "./install.js";
 
 import {
-  normalizeEffort as _normalizeEffort,
-  parseRawModels as _parseRawModels,
-  resolveRawModelId as _resolveRawModelId,
-  rawListsEqual as _rawListsEqual,
+  normalizeModelId,
+  normalizeEffort,
+  parseRawModels,
+  resolveRawModelId,
+  rawListsEqual,
   type RawModel,
-  type ModelFamily,
-  type AvailableModel,
+  type ModelCatalog,
 } from "./model-utils.js";
 
-// Re-export pure utils for tests and backward compat
-export const normalizeEffort = _normalizeEffort;
-export const parseRawModels = _parseRawModels;
-export const resolveRawModelId = _resolveRawModelId;
-export const rawListsEqual = _rawListsEqual;
+// Re-export pure utils for backward compat
+export {
+  normalizeModelId,
+  normalizeEffort,
+  parseRawModels,
+  resolveRawModelId,
+  rawListsEqual,
+  type RawModel,
+  type ModelCatalog,
+};
 
 const CACHE_FILE = path.join(
   os.homedir(),
@@ -56,38 +61,50 @@ const CACHE_TTL_MS = 6 * 60 * 60 * 1000; // 6h — picker never stale, backgroun
 // Per-provider default configurability (BB settings pattern)
 // ---------------------------------------------------------------------------
 
-function getPreferredDefault(): { model: string; effort: string } | null {
+function getPreferredDefault(launchEnv?: Record<string, string>): { model: string; effort: string } | null {
+  // 1. In-band RPC launchSpec env (works across distributed / remote hosts)
+  const envModel = launchEnv?.BB_ANTIGRAVITY_DEFAULT_MODEL || process.env.BB_ANTIGRAVITY_DEFAULT_MODEL;
+  const envEffort = launchEnv?.BB_ANTIGRAVITY_DEFAULT_REASONING || process.env.BB_ANTIGRAVITY_DEFAULT_REASONING;
+  if (envModel && envModel.trim()) {
+    return {
+      model: normalizeModelId(envModel),
+      effort: normalizeEffort(envEffort || "medium"),
+    };
+  }
+
+  // 2. Local settings-cache.json fallback (local machine backwards compatibility)
   try {
     const p = path.join(os.homedir(), ".bb", "plugins", "google-antigravity-acp", "settings-cache.json");
     if (fs.existsSync(p)) {
       const j = JSON.parse(fs.readFileSync(p, "utf8"));
       if (j.defaultModel && typeof j.defaultModel === "string" && j.defaultModel.trim()) {
         return {
-          model: j.defaultModel.trim().toLowerCase().replace(/[^a-z0-9.]+/g, "-").replace(/^-+|-+$/g, ""),
-          effort: _normalizeEffort(j.defaultReasoningEffort || "medium"),
+          model: normalizeModelId(j.defaultModel),
+          effort: normalizeEffort(j.defaultReasoningEffort || "medium"),
         };
       }
     }
-  } catch {}
-  const envModel = process.env.BB_ANTIGRAVITY_DEFAULT_MODEL;
-  if (envModel && envModel.trim()) {
-    return { model: envModel.trim().toLowerCase().replace(/[^a-z0-9.]+/g, "-").replace(/^-+|-+$/g, ""), effort: _normalizeEffort(process.env.BB_ANTIGRAVITY_DEFAULT_REASONING || "medium") };
+  } catch (err) {
+    if (process.env.DEBUG) console.error("[acp-antigravity] Failed reading settings cache:", err);
   }
+
   return null;
 }
 
-// Wrap parse to inject settings without changing pure util signature
-function parseWithSettings(rawList: RawModel[]) {
-  const pref = getPreferredDefault();
-  return _parseRawModels(rawList, undefined, pref);
+// Wrap parse to inject settings
+function parseWithSettings(rawList: RawModel[], launchEnv?: Record<string, string>): ModelCatalog {
+  const pref = getPreferredDefault(launchEnv);
+  return parseRawModels(rawList, undefined, pref);
 }
 
 // ---- Discovery and caching ------------------------------------------------
 
-let activeRawModels: RawModel[] = [];
-let activeFamilies = new Map<string, ModelFamily>();
-let activeModels: AvailableModel[] = [];
-let activeDefaultFamilyId = "";
+let activeCatalog: ModelCatalog = {
+  families: new Map(),
+  models: [],
+  defaultFamilyId: "",
+  rawModels: [],
+};
 let isInitialized = false;
 let discoveryPromise: Promise<void> | null = null;
 let cacheTimestamp = 0;
@@ -98,23 +115,21 @@ function isCacheStale(): boolean {
   return Date.now() - cacheTimestamp > CACHE_TTL_MS;
 }
 
-function loadFromDiskCache(): boolean {
+function loadFromDiskCache(launchEnv?: Record<string, string>): boolean {
   try {
     if (fs.existsSync(CACHE_FILE)) {
       const data = JSON.parse(fs.readFileSync(CACHE_FILE, "utf8"));
       if (Array.isArray(data.rawModels) && data.rawModels.length > 0) {
-        activeRawModels = data.rawModels;
         cacheTimestamp = typeof data.timestamp === "number" ? data.timestamp : 0;
-        const parsed = parseWithSettings(activeRawModels);
-        activeFamilies = parsed.families;
-        activeModels = parsed.models;
-        activeDefaultFamilyId = parsed.defaultFamilyId;
+        activeCatalog = parseWithSettings(data.rawModels, launchEnv);
         isInitialized = true;
         lastRefreshAt = cacheTimestamp || Date.now();
         return true;
       }
     }
-  } catch {}
+  } catch (err) {
+    if (process.env.DEBUG) console.error("[acp-antigravity] Failed loading disk cache:", err);
+  }
   return false;
 }
 
@@ -123,7 +138,9 @@ function saveToDiskCache(rawModels: RawModel[]) {
     fs.mkdirSync(path.dirname(CACHE_FILE), { recursive: true });
     cacheTimestamp = Date.now();
     fs.writeFileSync(CACHE_FILE, JSON.stringify({ rawModels, timestamp: cacheTimestamp }), "utf8");
-  } catch {}
+  } catch (err) {
+    if (process.env.DEBUG) console.error("[acp-antigravity] Failed saving disk cache:", err);
+  }
 }
 
 async function queryAcpServer(
@@ -201,12 +218,8 @@ async function refreshModels(launchSpec?: { command: string; args: string[]; env
     .then((rawList) => {
       if (rawList && rawList.length > 0) {
         // Stale check: diff against current cache — handles added/deprecated models so picker never stale
-        if (!isInitialized || !_rawListsEqual(rawList, activeRawModels)) {
-          activeRawModels = rawList;
-          const parsed = parseWithSettings(activeRawModels);
-          activeFamilies = parsed.families;
-          activeModels = parsed.models;
-          activeDefaultFamilyId = parsed.defaultFamilyId;
+        if (!isInitialized || !rawListsEqual(rawList, activeCatalog.rawModels)) {
+          activeCatalog = parseWithSettings(rawList, env);
           isInitialized = true;
           saveToDiskCache(rawList);
         } else {
@@ -221,7 +234,9 @@ async function refreshModels(launchSpec?: { command: string; args: string[]; env
         lastRefreshAt = Date.now();
       }
     })
-    .catch(() => {})
+    .catch((err) => {
+      if (process.env.DEBUG) console.error("[acp-antigravity] Failed refreshing models:", err);
+    })
     .finally(() => {
       discoveryPromise = null;
     });
@@ -234,7 +249,7 @@ loadFromDiskCache();
 
 export const experimental_providerBridge = {
   experimental_apiVersion: 1 as const,
-  handleLine: async (line: string, ctx?: any) => {
+  handleLine: async (line: string) => {
     try {
       const parsed = JSON.parse(line);
       if (parsed && typeof parsed === "object") {
@@ -244,11 +259,8 @@ export const experimental_providerBridge = {
             // Stale or cold — await discovery so first picker is fresh
             await refreshModels(launchSpec);
           } else {
-            // Re-derive from cache to honor current defaultModel setting (no cache invalidation needed)
-            const reparsed = parseWithSettings(activeRawModels);
-            activeFamilies = reparsed.families;
-            activeModels = reparsed.models;
-            activeDefaultFamilyId = reparsed.defaultFamilyId;
+            // Re-derive from cache to honor current defaultModel setting
+            activeCatalog = parseWithSettings(activeCatalog.rawModels, launchSpec?.env);
             if (Date.now() - lastRefreshAt > 60_000) {
               // Background refresh (debounced 60s) to pick up added/deprecated models without blocking
               refreshModels(launchSpec);
@@ -260,7 +272,7 @@ export const experimental_providerBridge = {
               jsonrpc: "2.0",
               id: parsed.id,
               result: {
-                models: activeModels,
+                models: activeCatalog.models,
                 selectedOnlyModels: [],
               },
             }) + "\n",
@@ -276,24 +288,26 @@ export const experimental_providerBridge = {
           if (!parsed.params.options) {
             parsed.params.options = {};
           }
+          const launchSpec = parsed.params?.options?.providerOptions?.acpLaunchSpec;
           if (!isInitialized) {
-            loadFromDiskCache();
+            loadFromDiskCache(launchSpec?.env);
+            if (!isInitialized && launchSpec) {
+              await refreshModels(launchSpec);
+            }
           }
           const resolved = resolveRawModelId(
             parsed.params.options.model,
             parsed.params.options.reasoningLevel,
-            activeFamilies,
-            activeDefaultFamilyId,
-            activeRawModels,
+            activeCatalog,
           );
           parsed.params.options.model = resolved;
           line = JSON.stringify(parsed);
         }
       }
-    } catch {
-      // Fall through to default line handler on parse error
+    } catch (err) {
+      if (process.env.DEBUG) console.error("[acp-antigravity] Error in handleLine:", err);
     }
-    return experimental_acpProviderBridge.handleLine(line, ctx);
+    return experimental_acpProviderBridge.handleLine(line);
   },
   onClose: () => {
     return experimental_acpProviderBridge.onClose?.();
@@ -303,14 +317,17 @@ export const experimental_providerBridge = {
 export default experimental_defineHostEntry({
   contract: agyHostContract,
   handlers: {
-    install: async (input) =>
-      runInstall({
-        installDir: input.installDir,
-        binDir: input.binDir,
-        force: input.force,
-        updatePath: input.updatePath,
-        source: input.source,
-      }),
-    probe: async () => probeLocal(),
+    probe: async () => {
+      return probeLocal();
+    },
+    install: async (params) => {
+      return runInstall({
+        installDir: params.installDir,
+        binDir: params.binDir,
+        force: params.force,
+        updatePath: params.updatePath,
+        source: params.source,
+      });
+    },
   },
 });
