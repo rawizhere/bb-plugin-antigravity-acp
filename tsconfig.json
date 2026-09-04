@@ -17,6 +17,7 @@
   "include": [
     "server.ts",
     "host.ts",
+    "model-utils.ts",
     "contract.ts",
     "install.ts"
   ]
