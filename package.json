@@ -1,10 +1,10 @@
 {
   "name": "bb-plugin-google-antigravity-acp",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "type": "module",
   "engines": {
-    "bb": ">=0.40",
-    "bbPluginSdk": ">=0.4.21"
+    "bb": ">=0.42",
+    "bbPluginSdk": ">=0.4.45"
   },
   "bb": {
     "name": "Google Antigravity (ACP)",
@@ -16,7 +16,7 @@
     "host": "./host.ts"
   },
   "dependencies": {
-    "@get-bb/plugin-sdk": "0.4.22",
+    "@get-bb/plugin-sdk": "^0.4.47",
     "zod": "^4.3.6"
   },
   "devDependencies": {
