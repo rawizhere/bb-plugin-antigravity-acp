@@ -64,7 +64,9 @@ export default async function plugin(bb: BbPluginApi) {
     }
     return {
       displayName: "Google Antigravity",
-      command: "agy_acp_server.par",
+      // Windows installs `agy_acp_server.exe`, POSIX uses `.par`. Command
+      // and args resolve on the bb server's platform.
+      command: detectTarget().binaryName,
       args: launchArgs,
       env,
     };

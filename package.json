@@ -2,6 +2,10 @@
   "name": "bb-plugin-google-antigravity-acp",
   "version": "0.2.3",
   "type": "module",
+  "scripts": {
+    "test": "node --import tsx --test tests/model-utils.test.ts test/wrapper-render.test.mjs test/wrapper-proxy.test.mjs test/install-handshake.test.mjs",
+    "test:unit": "node --loader tsx --test tests/model-utils.test.ts"
+  },
   "engines": {
     "bb": ">=0.42",
     "bbPluginSdk": ">=0.4.45"
@@ -18,10 +22,6 @@
   "dependencies": {
     "@get-bb/plugin-sdk": "^0.4.50",
     "zod": "^4.3.6"
-  },
-  "scripts": {
-    "test": "node --import tsx --test tests/model-utils.test.ts",
-    "test:unit": "node --loader tsx --test tests/model-utils.test.ts"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
