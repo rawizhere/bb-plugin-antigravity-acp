@@ -1,6 +1,6 @@
 {
   "name": "bb-plugin-google-antigravity-acp",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "type": "module",
   "scripts": {
     "test": "node --import tsx --test tests/model-utils.test.ts test/wrapper-render.test.mjs test/wrapper-proxy.test.mjs test/install-handshake.test.mjs",
