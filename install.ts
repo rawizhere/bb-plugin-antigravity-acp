@@ -24,7 +24,7 @@ export type DistMap = Record<string, DistEntry>;
 // this exact commit (never from an unpinned `main`), so someone landing a
 // commit on the registry cannot redirect the install to arbitrary binaries.
 // Bump this SHA when the plugin is updated to track newer releases.
-export const REGISTRY_COMMIT = "785dd1f413d9dc2e3433966b079384c5d9e5fc02";
+export const REGISTRY_COMMIT = "81bf71b55e15f630c4fb8a86d20d3088071d2071";
 const REGISTRY_URL = `https://raw.githubusercontent.com/agentclientprotocol/registry/${REGISTRY_COMMIT}/antigravity-acp/agent.json`;
 
 // Mirrors the ACP registry entry (agentclientprotocol/registry →
@@ -34,29 +34,29 @@ const REGISTRY_URL = `https://raw.githubusercontent.com/agentclientprotocol/regi
 export const FALLBACK_DIST: DistMap = {
   "darwin-aarch64": {
     archive:
-      "https://dl.google.com/agy-extensions/releases/macos/agy-acp-server-agy_acp_server_20260818_01_RC01-darwin-arm64.zip",
+      "https://dl.google.com/agy-extensions/releases/macos/agy-acp-server-agy_acp_server_1.1.1-darwin-arm64.zip",
     cmd: "./agy_acp_server.par",
   },
   "linux-x86_64": {
     archive:
-      "https://dl.google.com/agy-extensions/releases/linux/agy-acp-server-agy_acp_server_20260818_01_RC01-linux-x86_64.zip",
+      "https://dl.google.com/agy-extensions/releases/linux/agy-acp-server-agy_acp_server_1.1.1-linux-x86_64.zip",
     cmd: "./agy_acp_server.par",
     args: ["--uid="],
   },
   "linux-aarch64": {
     archive:
-      "https://dl.google.com/agy-extensions/releases/linux/agy-acp-server-agy_acp_server_20260818_01_RC01-linux-arm64.zip",
+      "https://dl.google.com/agy-extensions/releases/linux/agy-acp-server-agy_acp_server_1.1.1-linux-arm64.zip",
     cmd: "./agy_acp_server.par",
     args: ["--uid="],
   },
   "windows-x86_64": {
     archive:
-      "https://dl.google.com/agy-extensions/releases/windows/agy-acp-server-agy_acp_server_20260818_01_RC01-windows-x86_64.zip",
+      "https://dl.google.com/agy-extensions/releases/windows/agy-acp-server-agy_acp_server_1.1.1-windows-x86_64.zip",
     cmd: "./agy_acp_server.exe",
   },
   "windows-aarch64": {
     archive:
-      "https://dl.google.com/agy-extensions/releases/windows/agy-acp-server-agy_acp_server_20260818_01_RC01-windows-arm64.zip",
+      "https://dl.google.com/agy-extensions/releases/windows/agy-acp-server-agy_acp_server_1.1.1-windows-arm64.zip",
     cmd: "./agy_acp_server.exe",
   },
 };
