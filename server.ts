@@ -75,10 +75,9 @@ export default async function plugin(bb: BbPluginApi) {
       installUrl: "https://antigravity.google/docs/ide/extensions/zed",
       iconTint: { light: "#4285F4", dark: "#8AB4F8" },
     },
-    serviceTiers: [
-      { id: "default", label: "Default" },
-      { id: "fast", label: "Fast" },
-    ],
+    // Antigravity exposes its effort variants as separate ACP model ids. It
+    // does not expose a separate BB service tier or reasoning control.
+    reasoningLevels: [{ id: "medium", label: "Medium" }],
     // Only listed on hosts where the ACP server binary is installed and the
     // bridge health probe passes.
     experimental_visibility: "installed",
@@ -87,7 +86,7 @@ export default async function plugin(bb: BbPluginApi) {
     models: { scope: "host" },
     maintenance: { health: true, usage: false, installation: false },
     capabilities: {
-      supportsServiceTier: true,
+      supportsServiceTier: false,
       supportsNativeUserQuestion: false,
       supportsManualCompaction: false,
       supportsThreadArchive: false,
@@ -96,9 +95,21 @@ export default async function plugin(bb: BbPluginApi) {
       // session/fork.
       fork: "none",
       permissionModes: ["accept-edits", "full"],
-      reasoningLevels: ["low", "medium", "high", "xhigh", "max"],
+      reasoningLevels: ["medium"],
     },
     composerActions: [],
+    experimental_nativeSkillRoots: {
+      user: [
+        ".agents/skills",
+        ".gemini/skills",
+        ".gemini/config/skills",
+        ".gemini/antigravity-cli/skills",
+      ],
+      project: [
+        { path: ".agents/skills", ancestors: true },
+        { path: ".gemini/skills", ancestors: true },
+      ],
+    },
     experimental_bridgeOptions: {
       acpLaunchSpec: LAUNCH,
     },
