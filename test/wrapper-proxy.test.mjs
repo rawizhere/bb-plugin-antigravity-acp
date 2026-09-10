@@ -34,6 +34,18 @@ function usageMetadata() {
   ]);
 }
 
+// Regression guard: current server builds omit field 5 and only send field 2.
+function usageMetadataOnlyUncached() {
+  const usage = [
+    ...field(2, 0, varint(11_452)),
+  ];
+  const size = [...field(4, 0, varint(1_000_000))];
+  return Buffer.from([
+    ...field(9, 2, [...varint(usage.length), ...usage]),
+    ...field(24, 2, [...varint(size.length), ...size]),
+  ]);
+}
+
 function collectLines(child) {
   const events = [];
   const waiters = [];
@@ -129,4 +141,38 @@ test("proxies ACP lines and emits usage for the matching prompt session", async 
   assert.ok(responseEvent.emittedAt - sentAt >= 50, `response was delayed only ${responseEvent.emittedAt - sentAt}ms`);
   const afterPromptIndex = result.lines.findIndex((line) => line.params?.update?.title === "after-prompt");
   assert.ok(afterPromptIndex > promptResponseIndex);
+});
+
+test("emits usage when the server omits cached-token field 5", async () => {
+  const root = await mkdtemp(join(tmpdir(), "agy-wrapper-test-"));
+  const geminiHome = join(root, "gemini");
+  const conversations = join(geminiHome, "antigravity-acp", "conversations");
+  await mkdir(conversations, { recursive: true });
+  const db = new DatabaseSync(join(conversations, "session-123.db"));
+  db.exec("PRAGMA journal_mode=DELETE; CREATE TABLE steps (idx INTEGER, step_type INTEGER, metadata BLOB)");
+  db.prepare("INSERT INTO steps VALUES (?, ?, ?)").run(1, 15, usageMetadataOnlyUncached());
+  db.close();
+
+  const wrapper = join(root, "agy_acp_server.par");
+  await writeFile(wrapper, renderWrapperScript({ nodePath: process.execPath, realBinaryPath: null }), { mode: 0o755 });
+  const fake = join(root, "fake-agent.mjs");
+  await copyFile(join(process.cwd(), "test/fixtures/fake-agent.mjs"), fake);
+  await chmod(fake, 0o755);
+  const child = spawn(wrapper, [], {
+    env: { ...process.env, ANTIGRAVITY_REAL_SERVER_PATH: fake, GEMINI_HOME: geminiHome },
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  const collector = collectLines(child);
+  child.stdin.write(JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: 1, clientCapabilities: {} } }) + "\r\n");
+  child.stdin.write(JSON.stringify({ jsonrpc: "2.0", id: 2, method: "session/new", params: {} }) + "\r\n");
+  await collector.waitFor((line) => line.id === 2 && line.result?.sessionId === "session-123");
+  child.stdin.write(JSON.stringify({ jsonrpc: "2.0", id: 3, method: "session/prompt", params: { sessionId: "session-123" } }));
+  child.stdin.end();
+
+  const result = await collector.done;
+  assert.equal(result.code, 0, `${result.signal ?? "no signal"}: ${result.error}`);
+  const usageLines = result.lines.filter((line) => line.params?.update?.sessionUpdate === "usage_update");
+  assert.equal(usageLines.length, 1);
+  assert.deepEqual(usageLines[0].params.update, { sessionUpdate: "usage_update", used: 11_452, size: 1_000_000 });
+  assert.equal(usageLines[0].params.sessionId, "session-123");
 });

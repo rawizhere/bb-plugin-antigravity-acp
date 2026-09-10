@@ -120,9 +120,7 @@ function parsePb(buf) {
 }
 
 function extractContextUsage(dbPath) {
-  // Reads are synchronous by design: the DB is local, single-row indexed reads
-  // take ~1 ms, and intermediate reads are throttled; a worker thread was
-  // judged not worth the complexity.
+  // Synchronous by design: local single-row indexed reads are fast and throttled, a worker thread is not worth it.
   if (!existsSync(dbPath)) return null;
   let db;
   try {
@@ -148,8 +146,9 @@ function extractContextUsage(dbPath) {
           if (nested.fieldNum === 5) first = nested.value;
           if (nested.fieldNum === 2) second = nested.value;
         }
-        if (first !== null && second !== null) {
-          const total = first + second;
+        // Server builds put prompt tokens in field 2 and omit field 5, so treat either as optional.
+        if (first !== null || second !== null) {
+          const total = (first ?? 0) + (second ?? 0);
           if (!Number.isSafeInteger(total) || total < 0) return null;
           used = total;
         }
@@ -244,8 +243,7 @@ function main() {
     const written = dest.write(data);
     if (!written) {
       if (dest === process.stdout) {
-        // End-to-end backpressure: stop reading the child until the client
-        // drains. Lines already decoded from the current chunk stay queued.
+        // Stop reading the child until the client drains.
         pumpBlocked = true;
         rlOut.pause();
         dest.once("drain", () => {
@@ -352,8 +350,7 @@ function main() {
     pump();
   });
 
-  // Drains the queue iteratively (never recursively) until it is empty or a
-  // step blocks the pump (busy DB retry, stdout backpressure).
+  // Drain the queue iteratively until empty or a step blocks the pump.
   pump = () => {
     if (pumping) return;
     pumping = true;
@@ -415,8 +412,7 @@ function main() {
   process.stdout.on("error", (err) => {
     acceptingClientInput = false;
     if (err.code === "EPIPE") {
-      // The client went away: drop pending output, unblock the pump so the
-      // child-close path can finish, and stop the server.
+      // The client went away: drop pending output and stop cleanly.
       outputAbandoned = true;
       outQueue.length = 0;
       pumpBlocked = false;
