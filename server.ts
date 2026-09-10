@@ -2,20 +2,13 @@ import type {
   BbPluginApi,
   PluginCliContext,
 } from "@get-bb/plugin-sdk";
-import fs from "node:fs";
-import path from "node:path";
-import os from "node:os";
 import { agyHostContract } from "./contract.js";
 import { FALLBACK_DIST, detectTarget, probeLocal, runInstall, type InstallResult } from "./install.js";
 
 const PROVIDER_ID = "acp-antigravity";
 
 export default async function plugin(bb: BbPluginApi) {
-  // Where the ACP server lives on target machines. Installs run on each host
-  // (`bb google-antigravity-acp install [--machine ...]`), so `~` expands per
-  // host. The launch spec sets no env: the server binary and its sandbox
-  // helper are linked into binDir on every machine and found via PATH, like
-  // bb's builtin ACP agents.
+  // Installs run on each host, so ~ expands per host and binaries are found via PATH.
   const settings = bb.settings.define({
     installDir: {
       type: "string",
@@ -46,12 +39,7 @@ export default async function plugin(bb: BbPluginApi) {
   });
   let saved = await settings.get();
 
-  // Launch args come from the ACP registry (mirrored in FALLBACK_DIST): the
-  // registry specifies `--uid=` for linux-x86_64/linux-aarch64 only. The
-  // launch spec is registered server-side, so platform resolution uses the
-  // server's own platform — the common case where bb runs on the same machine
-  // that launches the agent. Installs record the per-platform args in their
-  // manifest too.
+  // Launch args come from the ACP registry, mirrored in FALLBACK_DIST; platform resolution uses the server's own platform.
   const launchArgs = FALLBACK_DIST[detectTarget().distKey]?.args ?? [];
 
   function buildLaunchSpec(currentSettings: typeof saved) {
@@ -64,28 +52,12 @@ export default async function plugin(bb: BbPluginApi) {
     }
     return {
       displayName: "Google Antigravity",
-      // Windows installs `agy_acp_server.exe`, POSIX uses `.par`. Command
-      // and args resolve on the bb server's platform.
+      // Windows installs the .exe, POSIX the .par. Both resolve on the server's platform.
       command: detectTarget().binaryName,
       args: launchArgs,
       env,
     };
   }
-
-  // Persist default model settings for the host bridge (host reads this file + env fallback).
-  // This keeps per-provider defaults configurable via BB Settings UI, aligning with other provider plugins.
-  function writeSettingsCache(vals: typeof saved) {
-    try {
-      const dir = path.join(os.homedir(), ".bb", "plugins", "google-antigravity-acp");
-      fs.mkdirSync(dir, { recursive: true });
-      fs.writeFileSync(
-        path.join(dir, "settings-cache.json"),
-        JSON.stringify({ defaultModel: vals.defaultModel ?? "", defaultReasoningEffort: vals.defaultReasoningEffort ?? "", updatedAt: Date.now() }),
-        "utf8",
-      );
-    } catch {}
-  }
-  writeSettingsCache(saved);
 
   let providerRegistration: { dispose: () => void } | null = null;
 
@@ -100,9 +72,7 @@ export default async function plugin(bb: BbPluginApi) {
       family: "acp",
       icon: "./icons/google-antigravity.svg",
       strings: {
-        // The Antigravity server authenticates in-band (ACP auth requests):
-        // oauth-personal (Google account), oauth-business (Gemini Enterprise),
-        // gemini-api-key, or agent-platform (ADC/API key).
+        // The server authenticates in-band via Google account, Gemini Enterprise, Gemini API key, or Agent Platform.
         signInHint:
           "Open a Google Antigravity thread and follow the login prompt (Google account, Gemini API key, or Agent Platform).",
         expiredHint:
@@ -110,14 +80,11 @@ export default async function plugin(bb: BbPluginApi) {
         installUrl: "https://antigravity.google/docs/ide/extensions/zed",
         iconTint: { light: "#4285F4", dark: "#8AB4F8" },
       },
-      // Antigravity exposes its effort variants as separate ACP model ids. It
-      // does not expose a separate BB service tier or reasoning control.
+      // Effort variants are separate ACP model ids; no separate service tier control.
       reasoningLevels: [{ id: "medium", label: "Medium" }],
-      // Only listed on hosts where the ACP server binary is installed and the
-      // bridge health probe passes.
+      // Only listed on hosts where the binary is installed and the probe passes.
       experimental_visibility: "installed",
-      // Every ACP agent answers model/list from its own account/agent state, so
-      // one probe per machine serves every workspace on it.
+      // One probe per machine serves every workspace on it.
       models: { scope: "host" },
       maintenance: { health: true, usage: false, installation: false },
       capabilities: {
@@ -126,8 +93,7 @@ export default async function plugin(bb: BbPluginApi) {
         supportsManualCompaction: false,
         supportsThreadArchive: false,
         supportsThreadRename: false,
-        // agy_acp_server.par advertises sessionCapabilities {list, resume}; no
-        // session/fork.
+        // The server advertises session list and resume but no fork.
         fork: "none",
         permissionModes: ["accept-edits", "full"],
         reasoningLevels: ["low", "medium", "high"],
@@ -155,7 +121,6 @@ export default async function plugin(bb: BbPluginApi) {
 
   settings.onChange((next) => {
     saved = next;
-    writeSettingsCache(next);
     registerProvider(next);
   });
 

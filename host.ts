@@ -1,19 +1,4 @@
-// bb-plugin-google-antigravity-acp host entry.
-//
-// Ships bb's canonical ACP provider bridge (@get-bb/plugin-sdk/
-// provider-bridge/acp — the same bridge the builtin provider-acp plugin
-// uses). The runtime spawns this artifact as the provider bridge; per-agent
-// launch facts arrive in `options.providerOptions.acpLaunchSpec` from the
-// server-side registration in server.ts.
-//
-// We wrap the bridge to dynamically discover Antigravity's model options from
-// the running ACP server (agy_acp_server.par), group reasoning variants into
-// clean model families with supported reasoning efforts, and resolve launch
-// options (model + reasoningLevel) to concrete backend model IDs.
-//
-// The same artifact also implements the plugin's host RPC (`bb
-// google-antigravity-acp install` / `status`), so installs run on the machine
-// where the daemon executes instead of on the bb server.
+// Host entry: wraps the shared ACP provider bridge, discovers models from the running Antigravity server, and serves the install/status host RPC.
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
@@ -36,16 +21,6 @@ import {
   type ModelCatalog,
 } from "./model-utils.js";
 
-// Re-export pure utils for backward compat
-export {
-  normalizeModelId,
-  normalizeEffort,
-  parseRawModels,
-  resolveRawModelId,
-  rawListsEqual,
-  type RawModel,
-  type ModelCatalog,
-};
 
 const CACHE_FILE = path.join(
   os.homedir(),
@@ -57,9 +32,7 @@ const CACHE_FILE = path.join(
 
 const CACHE_TTL_MS = 6 * 60 * 60 * 1000; // 6h — picker never stale, background refresh handles rotation
 
-// ---------------------------------------------------------------------------
-// Per-provider default configurability (BB settings pattern)
-// ---------------------------------------------------------------------------
+// Per-provider default configurability
 
 function getPreferredDefault(launchEnv?: Record<string, string>): { model: string; effort: string } | null {
   // 1. In-band RPC launchSpec env (works across distributed / remote hosts)
@@ -70,22 +43,6 @@ function getPreferredDefault(launchEnv?: Record<string, string>): { model: strin
       model: normalizeModelId(envModel),
       effort: normalizeEffort(envEffort || "medium"),
     };
-  }
-
-  // 2. Local settings-cache.json fallback (local machine backwards compatibility)
-  try {
-    const p = path.join(os.homedir(), ".bb", "plugins", "google-antigravity-acp", "settings-cache.json");
-    if (fs.existsSync(p)) {
-      const j = JSON.parse(fs.readFileSync(p, "utf8"));
-      if (j.defaultModel && typeof j.defaultModel === "string" && j.defaultModel.trim()) {
-        return {
-          model: normalizeModelId(j.defaultModel),
-          effort: normalizeEffort(j.defaultReasoningEffort || "medium"),
-        };
-      }
-    }
-  } catch (err) {
-    if (process.env.DEBUG) console.error("[acp-antigravity] Failed reading settings cache:", err);
   }
 
   return null;

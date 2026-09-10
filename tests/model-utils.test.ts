@@ -148,12 +148,11 @@ describe("parseRawModels — dynamic discovery", () => {
 
 describe("resolveRawModelId — launch variant resolution (tested via payload, not LLM)", () => {
   const catalog = parseRawModels(CURRENT_RAW);
-  const { families, defaultFamilyId } = catalog;
 
   it("resolves family + reasoning to concrete ACP id", () => {
-    assert.equal(resolveRawModelId("gemini-3.7-flash", "high", families, defaultFamilyId, CURRENT_RAW), "gemini-3.7-flash-high");
-    assert.equal(resolveRawModelId("gemini-3.7-flash", "medium", families, defaultFamilyId, CURRENT_RAW), "gemini-3.7-flash-medium");
-    assert.equal(resolveRawModelId("gemini-3.7-flash", "low", families, defaultFamilyId, CURRENT_RAW), "gemini-3.7-flash-low");
+    assert.equal(resolveRawModelId("gemini-3.7-flash", "high", catalog), "gemini-3.7-flash-high");
+    assert.equal(resolveRawModelId("gemini-3.7-flash", "medium", catalog), "gemini-3.7-flash-medium");
+    assert.equal(resolveRawModelId("gemini-3.7-flash", "low", catalog), "gemini-3.7-flash-low");
   });
 
   it("supports passing ModelCatalog object directly (clean abstraction)", () => {
@@ -163,19 +162,19 @@ describe("resolveRawModelId — launch variant resolution (tested via payload, n
   });
 
   it("resolves gemini-3.1-pro variants (including gemini-pro-agent mapping)", () => {
-    assert.equal(resolveRawModelId("gemini-3.1-pro", "high", families, defaultFamilyId, CURRENT_RAW), "gemini-pro-agent");
-    assert.equal(resolveRawModelId("gemini-3.1-pro", "low", families, defaultFamilyId, CURRENT_RAW), "gemini-3.1-pro-low");
-    const res = resolveRawModelId("gemini-3.1-pro", "medium", families, defaultFamilyId, CURRENT_RAW);
+    assert.equal(resolveRawModelId("gemini-3.1-pro", "high", catalog), "gemini-pro-agent");
+    assert.equal(resolveRawModelId("gemini-3.1-pro", "low", catalog), "gemini-3.1-pro-low");
+    const res = resolveRawModelId("gemini-3.1-pro", "medium", catalog);
     assert.ok(["gemini-pro-agent", "gemini-3.1-pro-low"].includes(res));
   });
 
   it("passes through raw legacy ids for backward compat", () => {
-    assert.equal(resolveRawModelId("gemini-3.7-flash-high", undefined, families, defaultFamilyId, CURRENT_RAW), "gemini-3.7-flash-high");
-    assert.equal(resolveRawModelId("gemini-pro-agent", undefined, families, defaultFamilyId, CURRENT_RAW), "gemini-pro-agent");
+    assert.equal(resolveRawModelId("gemini-3.7-flash-high", undefined, catalog), "gemini-3.7-flash-high");
+    assert.equal(resolveRawModelId("gemini-pro-agent", undefined, catalog), "gemini-pro-agent");
   });
 
   it("resolves default latest flash model at medium effort when model omitted", () => {
-    const resolved = resolveRawModelId(undefined, undefined, families, defaultFamilyId, CURRENT_RAW);
+    const resolved = resolveRawModelId(undefined, undefined, catalog);
     assert.equal(resolved, "gemini-3.8-flash-medium");
   });
 
@@ -191,9 +190,9 @@ describe("resolveRawModelId — launch variant resolution (tested via payload, n
       { id: "gemini-3.9-flash-ultra", name: "Gemini 3.9 Flash (Ultra)" },
       { id: "gemini-3.9-flash-default", name: "Gemini 3.9 Flash (Default)" },
     ];
-    const { families: ff, defaultFamilyId: df } = parseRawModels(future);
-    assert.equal(resolveRawModelId("gemini-3.9-flash", "ultra", ff, df, future), "gemini-3.9-flash-ultra");
-    assert.equal(resolveRawModelId("gemini-3.9-flash", "default", ff, df, future), "gemini-3.9-flash-default");
+    const futureCatalog = parseRawModels(future);
+    assert.equal(resolveRawModelId("gemini-3.9-flash", "ultra", futureCatalog), "gemini-3.9-flash-ultra");
+    assert.equal(resolveRawModelId("gemini-3.9-flash", "default", futureCatalog), "gemini-3.9-flash-default");
   });
 
   it("verifies intercepted payload rather than LLM identity", () => {

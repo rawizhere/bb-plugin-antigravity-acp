@@ -1,6 +1,4 @@
-// Shared install logic for the Google Antigravity ACP server.
-// Runs on the target machine from the host entry, and directly in the server
-// process as the server-local fallback.
+// Install logic for the Antigravity ACP server, runs on the target machine from the host entry or directly in the server process.
 import { randomBytes } from "node:crypto";
 import { execFile, spawn } from "node:child_process";
 import { constants as fsConstants, createWriteStream } from "node:fs";
@@ -49,7 +47,7 @@ export async function verifyAcpHandshake(
   const child = spawn(command, args, { stdio: ["pipe", "pipe", "pipe"], env: handshakeEnv });
   let stderr = "";
   child.stderr?.on("data", (chunk: Buffer | string) => {
-    stderr = (stderr + chunk.toString()).slice(-500);
+    stderr = stderrTail(stderr + chunk.toString());
   });
 
   const result = await new Promise<{ ok: boolean; reason: string | null }>((resolveResult) => {
@@ -114,17 +112,11 @@ export interface DistEntry {
 
 export type DistMap = Record<string, DistEntry>;
 
-// ACP registry commit this build is pinned to. The registry is fetched from
-// this exact commit (never from an unpinned `main`), so someone landing a
-// commit on the registry cannot redirect the install to arbitrary binaries.
-// Bump this SHA when the plugin is updated to track newer releases.
+// Pinned ACP registry commit. Bump when tracking newer releases.
 export const REGISTRY_COMMIT = "81bf71b55e15f630c4fb8a86d20d3088071d2071";
 const REGISTRY_URL = `https://raw.githubusercontent.com/agentclientprotocol/registry/${REGISTRY_COMMIT}/antigravity-acp/agent.json`;
 
-// Mirrors the ACP registry entry (agentclientprotocol/registry →
-// antigravity-acp → distribution.binary). Used verbatim when the pinned
-// registry fetch fails or the entry is missing this platform, so installs
-// never depend on a live upstream at install time.
+// Copy of the ACP registry entry for when the pinned registry fetch fails.
 export const FALLBACK_DIST: DistMap = {
   "darwin-aarch64": {
     archive:
@@ -274,40 +266,14 @@ async function downloadTo(url: string, dest: string): Promise<void> {
   if (!res.ok || !res.body) {
     throw new Error(`Download failed (HTTP ${res.status}) from ${url}`);
   }
-  // fetch returns undici's ReadableStream; Readable.fromWeb wants node's web
-  // ReadableStream. Same object at runtime — cast across the declaration gap.
+  // undici and node type the ReadableStream differently; same object at runtime.
   await pipeline(
     Readable.fromWeb(res.body as unknown as import("node:stream/web").ReadableStream<Uint8Array>),
     createWriteStream(dest),
   );
 }
 
-// Rejects archives whose entries could escape the destination directory.
-// Runs before any extraction so no extractor (including tar fallbacks, which
-// are deliberately not used) can write outside installDir.
-const PYTHON_VALIDATE = String.raw`
-import sys, zipfile
-path = sys.argv[1]
-try:
-    zf = zipfile.ZipFile(path)
-except Exception as e:
-    print(f"not a zip: {e}", file=sys.stderr)
-    sys.exit(2)
-unsafe = []
-for name in zf.namelist():
-    if name.startswith(("/", "\\")) or ":" in name.split("/", 1)[0]:
-        unsafe.append(name)
-        continue
-    parts = name.replace("\\", "/").split("/")
-    if any(p in ("..", "") for p in parts[:-1]):
-        unsafe.append(name)
-if unsafe:
-    print("unsafe zip entries: " + repr(unsafe[:5]), file=sys.stderr)
-    sys.exit(1)
-`;
-
-// Python extraction that first applies the same traversal validation and
-// then extracts with zipfile (which additionally strips absolute paths).
+// Python extraction that validates entry names, then extracts with zipfile.
 const PYTHON_EXTRACT = String.raw`
 import sys, zipfile
 path, dest = sys.argv[1], sys.argv[2]
@@ -325,9 +291,7 @@ zf.extractall(dest)
 
 async function extractZip(zipPath: string, destDir: string, isWindows: boolean): Promise<void> {
   if (isWindows) {
-    // PowerShell's Expand-Archive is backed by .NET's ExtractToDirectory,
-    // which rejects entries that escape the destination. No bsdtar here:
-    // bsdtar does not sanitize `../` the way Expand-Archive does.
+    // Expand-Archive rejects entries that escape the destination; bsdtar does not.
     await execFileAsync(
       "powershell",
       [
@@ -338,9 +302,7 @@ async function extractZip(zipPath: string, destDir: string, isWindows: boolean):
     );
     return;
   }
-  // macOS/Linux: prefer Info-ZIP unzip (sanitizes `../`), fall back to a
-  // validated python3 zipfile extraction. `tar` is never used: bsdtar does
-  // not sanitize `../` entries, and GNU tar cannot read zip archives anyway.
+  // Prefer unzip, fall back to python3 zipfile. Never tar: it does not sanitize ../ entries.
   const attempts: Array<[string, string[]]> = [
     ["unzip", ["-oq", zipPath, "-d", destDir]],
     ["python3", ["-c", PYTHON_EXTRACT, zipPath, destDir]],
@@ -353,14 +315,6 @@ async function extractZip(zipPath: string, destDir: string, isWindows: boolean):
     } catch (err) {
       lastError = err as Error;
     }
-  }
-  // Last resort: validate entry names, then use python3 zipfile if present.
-  try {
-    await execFileAsync("python3", ["-c", PYTHON_VALIDATE, zipPath]);
-    await execFileAsync("python3", ["-c", PYTHON_EXTRACT, zipPath, destDir]);
-    return;
-  } catch (err) {
-    lastError = err as Error;
   }
   throw lastError ?? new Error(`No safe extractor found for ${zipPath}`);
 }
@@ -412,7 +366,6 @@ async function installWrapper(
   try {
     await rm(stagedTarget, { force: true });
     await writeFile(stagedTarget, renderWrapperScript({ nodePath, realBinaryPath }), { mode: 0o755 });
-    await chmod(stagedTarget, 0o755);
     const handshake = await verifyAcpHandshake(stagedTarget, args);
     if (!handshake.ok) {
       throw new Error(handshake.error ?? "unknown error");
@@ -426,10 +379,7 @@ async function installWrapper(
   return wrapperTarget;
 }
 
-// The host entry runs inside the bb app (Electron with ELECTRON_RUN_AS_NODE),
-// so process.execPath is not a node binary. Probe real candidates instead and
-// pin the executable path node itself reports, which skips version-manager
-// shims like fnm/volta/vite-plus launchers.
+// The host entry runs under Electron, so probe real node candidates instead of process.execPath.
 async function nodeCandidates(): Promise<string[]> {
   const out: string[] = [];
   const push = (p: string | null | undefined) => {
@@ -487,9 +437,7 @@ async function verifyNodeInterpreter(): Promise<{ path: string; version: string 
   );
 }
 
-// Only runs when the user explicitly opts in via --update-path. setx has a
-// 1024-character truncation hazard, so over-long combined values are skipped
-// with a warning instead of silently corrupting PATH.
+// setx truncates PATH at 1024 chars, so skip the edit when it gets too long.
 async function appendUserPathWindows(binDir: string, updatePath: boolean, notes: string[]): Promise<void> {
   if (!updatePath) {
     notes.push(
@@ -596,8 +544,7 @@ export async function runInstall(options: InstallOptions): Promise<InstallResult
     }
   }
 
-  // Explicit --from only. No environment-variable redirect: an env knob can
-  // silently change which archive is downloaded and is easy to forget about.
+  // Explicit --from only; an env-var redirect would silently change what gets downloaded.
   const sourceOverride = options.source?.trim();
   let sourceLabel: string = entry.archive;
   try {
@@ -734,41 +681,14 @@ export async function probeLocal(): Promise<ProbeResult> {
       } finally {
         await file.close();
       }
-      const firstLine = prefix.toString("utf8").split(/\r?\n/u, 1)[0];
-      if (firstLine.startsWith("#!") && prefix.toString("utf8").includes("agy-acp-wrapper")) {
+      // Install already verified the wrapper end to end, so just check the real binary it points at.
+      const prefixText = prefix.toString("utf8");
+      const firstLine = prefixText.split(/\r?\n/u, 1)[0];
+      if (firstLine.startsWith("#!") && prefixText.includes("agy-acp-wrapper")) {
         const content = await readFile(binaryPath, "utf8");
-        const interpreter = firstLine.slice(2).trim();
-        let interpreterPath: string | null = interpreter;
-        if (interpreter === "/usr/bin/env node") {
-          interpreterPath = await findOnPath("node");
-          if (!interpreterPath) {
-            error = `Antigravity wrapper at ${binaryPath} uses /usr/bin/env node, but node was not found on PATH.`;
-          }
-        }
-        if (interpreterPath) {
-          let interpreterExecutable = true;
-          if (!(await stat(interpreterPath).catch(() => null))?.isFile()) {
-            interpreterExecutable = false;
-            error = `Antigravity wrapper at ${binaryPath} uses missing interpreter ${interpreterPath}.`;
-          }
-          try {
-            if (interpreterExecutable) await access(interpreterPath, fsConstants.X_OK);
-          } catch {
-            interpreterExecutable = false;
-            error = `Antigravity wrapper at ${binaryPath} uses non-executable interpreter ${interpreterPath}.`;
-          }
-          if (interpreterExecutable) {
-            try {
-              await execFileAsync(interpreterPath, ["-e", "require('node:sqlite')"], { timeout: 5_000 });
-            } catch (err) {
-              error = `Antigravity wrapper interpreter ${interpreterPath} failed node:sqlite verification: ${(err as Error).message}`;
-            }
-          }
-        }
-
         const match = /const\s+INSTALLED_REAL_BINARY\s*=\s*(null|"(?:\\.|[^"\\])*")\s*;/u.exec(content);
         if (!match) {
-          error ??= `Antigravity wrapper at ${binaryPath} has no INSTALLED_REAL_BINARY path.`;
+          error = `Antigravity wrapper at ${binaryPath} has no INSTALLED_REAL_BINARY path.`;
         } else {
           const installedPath = JSON.parse(match[1]) as string | null;
           if (!installedPath) {

@@ -1,5 +1,4 @@
-// Pure model parsing / resolution — extracted for unit testing
-// No BB/host dependencies, safe to import in tests.
+// Pure model parsing and resolution. No bb dependencies, so tests import it directly.
 
 export interface RawModel {
   id: string;
@@ -202,23 +201,11 @@ export function parseRawModels(
 export function resolveRawModelId(
   model: string | undefined,
   reasoningLevel: string | undefined,
-  familiesOrCatalog: Map<string, ModelFamily> | ModelCatalog,
-  defaultFamilyId?: string,
-  rawModels?: RawModel[],
+  catalog: ModelCatalog,
 ): string {
-  let families: Map<string, ModelFamily>;
-  let defFamId: string;
-  let rawList: RawModel[];
-
-  if ("families" in familiesOrCatalog) {
-    families = familiesOrCatalog.families;
-    defFamId = familiesOrCatalog.defaultFamilyId;
-    rawList = familiesOrCatalog.rawModels;
-  } else {
-    families = familiesOrCatalog;
-    defFamId = defaultFamilyId ?? "";
-    rawList = rawModels ?? [];
-  }
+  const families = catalog.families;
+  const defFamId = catalog.defaultFamilyId;
+  const rawList = catalog.rawModels;
 
   const cleanModel = model && model.trim() ? normalizeModelId(model) : "";
   const targetModel = cleanModel || defFamId || FALLBACK_DEFAULT_MODEL_ID;
