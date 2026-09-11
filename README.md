@@ -23,9 +23,24 @@ builtin ACP agents:
 ## Install the plugin
 
 ```sh
+bb plugin install git:github.com/rawizhere/bb-plugin-antigravity-acp --yes
+```
+
+For development, install from a checkout instead:
+
+```sh
 bb plugin install .                  # from this directory
 bb plugin reload google-antigravity-acp
 ```
+
+## Settings
+
+| Setting | Default | Purpose |
+|---|---|---|
+| `installDir` | `~/.local/opt/agy-acp-server` | Where the downloaded server binaries are extracted. `~` expands per machine. |
+| `binDir` | `~/.local/bin` | Where the server binary and sandbox helper are linked; must be on the machine's PATH. |
+| `defaultModel` | *(empty — latest Flash)* | Default model family for new threads, e.g. `gemini-3.8-flash` or `gemini-3.1-pro`. |
+| `defaultReasoningEffort` | *(empty — model default)* | Preferred effort variant for the default model: `low`, `medium`, or `high`. |
 
 ## Install the server binary
 

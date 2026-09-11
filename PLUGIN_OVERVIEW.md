@@ -6,18 +6,30 @@ Run bb threads on Google Antigravity through its official ACP server
 ## What it does
 
 Registers the provider `acp-antigravity` in bb with full ACP support: dynamic
-model catalog, reasoning levels, default/fast service tiers, in-band Google
+model catalog with per-model reasoning effort, session resume, in-band Google
 authentication (account, Gemini API key, or Agent Platform), and health-gated
 visibility — the provider only appears on machines where the server binary is
 installed and the probe passes.
 
+On macOS and Linux, a wrapper around the official binary reports exact token
+usage to bb, so native context tracking and context-meter plugins show live
+usage for Antigravity threads.
+
+Install the plugin:
+
+```sh
+bb plugin install git:github.com/rawizhere/bb-plugin-antigravity-acp --yes
+```
+
 ## Machine install
 
 `bb google-antigravity-acp install` downloads the official zip, extracts it
-without unzip/bsdtar dependencies, links the server binary and sandbox helper
-onto PATH per machine, and can update PATH on Windows with `--update-path`.
+without `tar` (validates zip entries against `../`/absolute paths), links the
+server binary and sandbox helper onto PATH per machine, and can update PATH
+on Windows with `--update-path`.
 `bb google-antigravity-acp status` shows the resolved binary and provider
-state. Installs run via host RPC on the machine where the daemon executes.
+state. Installs run via host RPC on the target machine — any enrolled machine,
+picked with `--machine`.
 
 ## Links
 
