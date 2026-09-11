@@ -204,6 +204,16 @@ export interface TargetInfo {
   isWindows: boolean;
 }
 
+// Launch specs are built on the bb server machine but spawn on a host; fix command/args for the spawning machine (env carries settings and stays untouched).
+export function localizeLaunchSpec(
+  spec: { command: string; args: string[] } | undefined,
+  t = detectTarget(),
+) {
+  if (!spec) return;
+  spec.command = t.binaryName;
+  spec.args = FALLBACK_DIST[t.distKey]?.args ?? [];
+}
+
 export function detectTarget(): TargetInfo {
   const platform = process.platform === "win32" ? "win32" : process.platform === "darwin" ? "darwin" : "linux";
   const arch = process.arch === "arm64" ? "aarch64" : process.arch === "x64" ? "x86_64" : process.arch;

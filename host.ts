@@ -9,7 +9,7 @@ import {
 } from "@get-bb/plugin-sdk/provider-bridge/acp";
 import { experimental_defineHostEntry } from "@get-bb/plugin-sdk/host";
 import { agyHostContract } from "./contract.js";
-import { probeLocal, runInstall } from "./install.js";
+import { localizeLaunchSpec, probeLocal, runInstall } from "./install.js";
 
 import {
   normalizeModelId,
@@ -48,6 +48,7 @@ function getPreferredDefault(launchEnv?: Record<string, string>): { model: strin
   return null;
 }
 
+// The launch spec is built on the bb server machine, but spawns happen here; fix command/args for this machine (env carries settings and stays untouched).
 // Wrap parse to inject settings
 function parseWithSettings(rawList: RawModel[], launchEnv?: Record<string, string>): ModelCatalog {
   const pref = getPreferredDefault(launchEnv);
@@ -212,6 +213,7 @@ export const experimental_providerBridge = {
       if (parsed && typeof parsed === "object") {
         if (parsed.method === "model/list") {
           const launchSpec = parsed.params?.providerOptions?.acpLaunchSpec;
+          localizeLaunchSpec(launchSpec);
           if (!isInitialized || isCacheStale()) {
             // Stale or cold — await discovery so first picker is fresh
             await refreshModels(launchSpec);
@@ -246,6 +248,7 @@ export const experimental_providerBridge = {
             parsed.params.options = {};
           }
           const launchSpec = parsed.params?.options?.providerOptions?.acpLaunchSpec;
+          localizeLaunchSpec(launchSpec);
           if (!isInitialized) {
             loadFromDiskCache(launchSpec?.env);
             if (!isInitialized && launchSpec) {

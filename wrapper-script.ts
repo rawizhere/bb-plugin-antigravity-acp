@@ -178,7 +178,10 @@ function signalNumber(signal) {
 
 function main() {
   const realBin = resolveRealBinary();
-  const child = spawn(realBin, process.argv.slice(2), {
+  // Linux builds segfault without --uid=; the launch spec may come from a machine that never saw the registry args, so ensure it here.
+  const childArgs = process.argv.slice(2);
+  if (process.platform === "linux" && !childArgs.includes("--uid=")) childArgs.push("--uid=");
+  const child = spawn(realBin, childArgs, {
     stdio: ["pipe", "pipe", "inherit"],
     env: process.env,
   });

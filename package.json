@@ -3,7 +3,7 @@
   "version": "0.2.5",
   "type": "module",
   "scripts": {
-    "test": "node --import tsx --test tests/model-utils.test.ts test/wrapper-render.test.mjs test/wrapper-proxy.test.mjs test/install-handshake.test.mjs"
+    "test": "node --import tsx --test tests/model-utils.test.ts test/wrapper-render.test.mjs test/wrapper-proxy.test.mjs test/install-handshake.test.mjs test/launch-spec.test.mjs"
   },
   "engines": {
     "bb": ">=0.42",

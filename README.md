@@ -76,7 +76,6 @@ needed.
 
 ```sh
 bb google-antigravity-acp install --machine macbook        # this machine
-bb google-antigravity-acp install --machine other-host     # another enrolled machine
 ```
 
 The machine's daemon shell must have `binDir` on PATH. The command warns

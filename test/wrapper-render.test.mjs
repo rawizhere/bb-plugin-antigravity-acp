@@ -6,6 +6,7 @@ test("renders a pinned or env-node wrapper and valid JavaScript", () => {
   const pinned = renderWrapperScript({ nodePath: "/custom/node", realBinaryPath: "/opt/agy/agy_acp_server.par" });
   assert.equal(pinned.split("\n", 1)[0], "#!/custom/node");
   assert.match(pinned, /const INSTALLED_REAL_BINARY = "/);
+  assert.match(pinned, /childArgs\.includes\("--uid="\)/);
   assert.match(pinned, /child\.stdin\.write\(line \+ "\\n"\)/);
   assert.doesNotMatch(pinned, /child\.stdin\.write\(line \+ "\\\\n"\)/);
   assert.doesNotThrow(() => new Function(pinned.replace(/^#![^\n]*\n/u, "")));

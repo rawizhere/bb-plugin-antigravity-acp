@@ -11,9 +11,9 @@ authentication (account, Gemini API key, or Agent Platform), and health-gated
 visibility — the provider only appears on machines where the server binary is
 installed and the probe passes.
 
-On macOS and Linux, a wrapper around the official binary reports exact token
-usage to bb, so native context tracking and context-meter plugins show live
-usage for Antigravity threads.
+On macOS, a wrapper around the official binary reports exact token usage to
+bb, so native context tracking and context-meter plugins show live usage for
+Antigravity threads.
 
 Install the plugin:
 
@@ -28,8 +28,7 @@ without `tar` (validates zip entries against `../`/absolute paths), links the
 server binary and sandbox helper onto PATH per machine, and can update PATH
 on Windows with `--update-path`.
 `bb google-antigravity-acp status` shows the resolved binary and provider
-state. Installs run via host RPC on the target machine — any enrolled machine,
-picked with `--machine`.
+state. Installs run via host RPC on the machine where the daemon executes.
 
 ## Links
 
