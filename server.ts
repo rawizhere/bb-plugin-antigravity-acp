@@ -1,11 +1,110 @@
-import type {
-  BbPluginApi,
-  PluginCliContext,
+import {
+  defineRpcContract,
+  type BbPluginApi,
+  type PluginCliContext,
 } from "@get-bb/plugin-sdk";
+import { z } from "zod";
+import { probeQuota } from "./quota.js";
 import { agyHostContract } from "./contract.js";
 import { FALLBACK_DIST, detectTarget, probeLocal, runInstall, type InstallResult } from "./install.js";
 
 const PROVIDER_ID = "acp-antigravity";
+
+
+const QuotaWindowSchema = z.object({
+  kind: z.enum(["five-hour", "daily", "weekly", "custom"]).default("custom"),
+  id: z.string().min(1),
+  label: z.string().min(1),
+  usedPercent: z.number().nonnegative(),
+  resetsAt: z.string().nullable(),
+  model: z.string().nullable(),
+  cost: z.object({
+    usedUsdCents: z.number().nonnegative(),
+    limitUsdCents: z.number().positive(),
+  }).nullable().default(null),
+});
+
+const UsageStatusSchema = z.discriminatedUnion("status", [
+  z.object({
+    status: z.literal("ok"),
+    plan: z.object({
+      id: z.string().min(1),
+      multiplier: z.number().int().positive().nullable(),
+    }).nullable().default(null),
+    accountEmail: z.string().nullable(),
+    planLabel: z.string().nullable(),
+    windows: z.array(QuotaWindowSchema),
+  }),
+  z.object({
+    status: z.literal("not_installed"),
+    plan: z.object({
+      id: z.string().min(1),
+      multiplier: z.number().int().positive().nullable(),
+    }).nullable().default(null),
+    accountEmail: z.string().nullable(),
+    planLabel: z.string().nullable(),
+  }),
+  z.object({
+    status: z.literal("unauthenticated"),
+    plan: z.object({
+      id: z.string().min(1),
+      multiplier: z.number().int().positive().nullable(),
+    }).nullable().default(null),
+    accountEmail: z.string().nullable(),
+    planLabel: z.string().nullable(),
+  }),
+  z.object({
+    status: z.literal("expired"),
+    plan: z.object({
+      id: z.string().min(1),
+      multiplier: z.number().int().positive().nullable(),
+    }).nullable().default(null),
+    accountEmail: z.string().nullable(),
+    planLabel: z.string().nullable(),
+  }),
+  z.object({
+    status: z.literal("error"),
+    message: z.string(),
+    plan: z.object({
+      id: z.string().min(1),
+      multiplier: z.number().int().positive().nullable(),
+    }).nullable().default(null),
+    accountEmail: z.string().nullable(),
+    planLabel: z.string().nullable(),
+  }),
+]);
+
+const ResourceSchema = z.object({
+  accountKey: z.string().min(1).nullable().default(null),
+  id: z.string().min(1),
+  providerId: z.string().min(1),
+  label: z.string().min(1),
+  scope: z.discriminatedUnion("kind", [
+    z.object({ kind: z.literal("shared") }),
+    z.object({ kind: z.literal("host"), hostId: z.string().min(1), hostName: z.string().min(1) }),
+  ]),
+});
+
+export const providerUsageContract = defineRpcContract({
+  "provider-usage.v1.listResources": {
+    input: z.object({}).strict(),
+    output: z.object({
+      label: z.string().min(1).optional(),
+      resources: z.array(ResourceSchema),
+    }),
+  },
+  "provider-usage.v1.getResource": {
+    input: z.object({
+      resourceId: z.string().min(1),
+      refresh: z.boolean(),
+    }).strict(),
+    output: z.object({
+      accountKey: z.string().min(1).nullable().default(null),
+      observedAt: z.number().int().nonnegative().nullable(),
+      usage: UsageStatusSchema,
+    }),
+  },
+});
 
 export default async function plugin(bb: BbPluginApi) {
   // Installs run on each host, so ~ expands per host and binaries are found via PATH.
@@ -86,7 +185,7 @@ export default async function plugin(bb: BbPluginApi) {
       experimental_visibility: "installed",
       // One probe per machine serves every workspace on it.
       models: { scope: "host" },
-      maintenance: { health: true, usage: false, installation: false },
+      maintenance: { health: true, usage: true, installation: false },
       capabilities: {
         supportsServiceTier: false,
         supportsNativeUserQuestion: false,
@@ -124,7 +223,142 @@ export default async function plugin(bb: BbPluginApi) {
     registerProvider(next);
   });
 
+  
   const host = bb.hosts.experimental_client({ contract: agyHostContract });
+
+  const usageCache = new Map<string, { observedAt: number | null; usage: any }>();
+
+  bb.rpc.register(
+    providerUsageContract,
+    {
+      "provider-usage.v1.listResources": async () => {
+        const hosts = await bb.sdk.hosts.list().catch(() => []);
+        const resources: any[] = [];
+        for (const h of hosts) {
+          if (h.type === "ephemeral") continue;
+          resources.push({
+            id: JSON.stringify([h.id, PROVIDER_ID]),
+            accountKey: null,
+            providerId: PROVIDER_ID,
+            label: "Google Antigravity",
+            scope: {
+              kind: "host",
+              hostId: h.id,
+              hostName: h.name,
+            },
+          });
+        }
+        return { resources };
+      },
+      "provider-usage.v1.getResource": async ({ resourceId, refresh }) => {
+        let hostId: string;
+        try {
+          const parsed = JSON.parse(resourceId);
+          hostId = parsed[0];
+        } catch {
+          throw new Error("Invalid resourceId");
+        }
+
+        const hosts = await bb.sdk.hosts.list().catch(() => []);
+        const targetHost = hosts.find((h: any) => h.id === hostId);
+        if (!targetHost) throw new Error("Usage resource no longer exists.");
+
+        if (targetHost.status === "disconnected") {
+          return {
+            accountKey: null,
+            observedAt: null,
+            usage: {
+              status: "error" as const,
+              message: "Machine is disconnected.",
+              plan: null,
+              accountEmail: null,
+              planLabel: null,
+            },
+          };
+        }
+
+        const cached = usageCache.get(resourceId);
+        if (!refresh && cached && cached.usage.status === "ok" && cached.observedAt && Date.now() - cached.observedAt < 60_000) {
+          return {
+            accountKey: cached.usage.accountEmail ? `antigravity:${cached.usage.accountEmail}` : null,
+            observedAt: cached.observedAt,
+            usage: cached.usage,
+          };
+        }
+
+        try {
+          let res: any;
+          try {
+            res = await host.call("getQuota", null, { hostId, signal: AbortSignal.timeout(15_000) });
+          } catch (callErr) {
+            // Local fallback if on the same machine
+            res = await probeQuota();
+          }
+
+          if (!res.ok) {
+            if (res.error === "not_installed" || res.error === "unauthenticated" || res.error === "expired") {
+              const usage = {
+                status: res.error as "not_installed" | "unauthenticated" | "expired",
+                plan: null,
+                accountEmail: res.accountEmail,
+                planLabel: res.planLabel,
+              };
+              usageCache.set(resourceId, { observedAt: null, usage });
+              return {
+                accountKey: res.accountEmail ? `antigravity:${res.accountEmail}` : null,
+                observedAt: null,
+                usage,
+              };
+            }
+            return {
+              accountKey: res.accountEmail ? `antigravity:${res.accountEmail}` : null,
+              observedAt: null,
+              usage: {
+                status: "error" as const,
+                message: res.error || "Failed to retrieve quota.",
+                plan: null,
+                accountEmail: res.accountEmail,
+                planLabel: res.planLabel,
+              },
+            };
+          }
+
+          const planId = (res.planLabel || "pro").toLowerCase();
+          const usage = {
+            status: "ok" as const,
+            plan: { id: planId, multiplier: null },
+            accountEmail: res.accountEmail,
+            planLabel: res.planLabel,
+            windows: res.windows.map((w: any) => ({
+              ...w,
+              cost: null,
+            })),
+          };
+          const observedAt = Date.now();
+          usageCache.set(resourceId, { observedAt, usage });
+          return {
+            accountKey: res.accountEmail ? `antigravity:${res.accountEmail}` : null,
+            observedAt,
+            usage,
+          };
+        } catch (err) {
+          return {
+            accountKey: null,
+            observedAt: null,
+            usage: {
+              status: "error" as const,
+              message: (err as Error).message || "Usage could not be collected from this machine.",
+              plan: null,
+              accountEmail: null,
+              planLabel: null,
+            },
+          };
+        }
+      },
+    },
+    { experimental_discoverable: true },
+  );
+
 
 
 

@@ -10,6 +10,7 @@ import {
 import { experimental_defineHostEntry } from "@get-bb/plugin-sdk/host";
 import { agyHostContract } from "./contract.js";
 import { localizeLaunchSpec, probeLocal, runInstall } from "./install.js";
+import { probeQuota } from "./quota.js";
 
 import {
   normalizeModelId,
@@ -279,6 +280,9 @@ export default experimental_defineHostEntry({
   handlers: {
     probe: async () => {
       return probeLocal();
+    },
+    getQuota: async () => {
+      return probeQuota();
     },
     install: async (params) => {
       return runInstall({
