@@ -39,4 +39,23 @@ export const agyHostContract = defineRpcContract({
       error: z.string().nullable(),
     }),
   },
+  getQuota: {
+    input: z.null(),
+    output: z.object({
+      ok: z.boolean(),
+      error: z.string().nullable(),
+      accountEmail: z.string().nullable(),
+      planLabel: z.string().nullable(),
+      windows: z.array(
+        z.object({
+          id: z.string().min(1),
+          kind: z.enum(["five-hour", "daily", "weekly", "custom"]),
+          label: z.string().min(1),
+          usedPercent: z.number().nonnegative(),
+          resetsAt: z.string().nullable(),
+          model: z.string().nullable(),
+        }),
+      ),
+    }),
+  },
 });
