@@ -274,6 +274,109 @@ export const experimental_providerBridge = {
   },
 };
 
+
+async function findAgyBinary(): Promise<string | null> {
+  const binary = process.platform === "win32" ? "agy.exe" : "agy";
+  const pathEnv = process.env.PATH ?? "";
+  const dirs = [
+    path.join(os.homedir(), ".local", "bin"),
+    ...pathEnv.split(process.platform === "win32" ? ";" : ":"),
+  ];
+  for (const dir of dirs) {
+    if (!dir) continue;
+    const full = path.join(dir, binary);
+    try {
+      const s = fs.statSync(full);
+      if (s.isFile()) return full;
+    } catch {
+      // continue looking
+    }
+  }
+  return null;
+}
+
+async function runAgyComplete(
+  prompt: string,
+  model?: string,
+  effort?: string,
+): Promise<{ ok: boolean; text: string; error: string | null }> {
+  const agyPath = await findAgyBinary();
+  if (!agyPath) {
+    return {
+      ok: false,
+      text: "",
+      error: "agy CLI not found in ~/.local/bin or on PATH",
+    };
+  }
+
+  const args = ["--disable-slash-commands"];
+  if (effort) {
+    args.push("--effort", effort);
+  }
+  if (model) {
+    args.push("--model", model);
+  }
+  args.push("-p", prompt);
+
+  return new Promise((resolve) => {
+    const proc = spawn(agyPath, args, {
+      env: process.env,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+
+    let stdout = "";
+    let stderr = "";
+    let timedOut = false;
+
+    const timer = setTimeout(() => {
+      timedOut = true;
+      proc.kill("SIGTERM");
+      setTimeout(() => proc.kill("SIGKILL"), 1000);
+      resolve({ ok: false, text: "", error: "Antigravity CLI timed out" });
+    }, 15000);
+
+    proc.stdout.on("data", (chunk) => {
+      stdout += chunk.toString("utf8");
+    });
+    proc.stderr.on("data", (chunk) => {
+      stderr += chunk.toString("utf8");
+    });
+
+    proc.on("error", (err) => {
+      clearTimeout(timer);
+      if (!timedOut) {
+        resolve({ ok: false, text: "", error: err.message });
+      }
+    });
+
+    proc.on("close", (code) => {
+      clearTimeout(timer);
+      if (timedOut) return;
+      if (code !== 0) {
+        resolve({
+          ok: false,
+          text: "",
+          error: stderr.trim() || `agy exited with code ${code}`,
+        });
+      } else {
+        resolve({
+          ok: true,
+          text: stdout.trim(),
+          error: null,
+        });
+      }
+    });
+  });
+}
+
+async function checkAgyStatus(): Promise<{ ready: boolean; message?: string }> {
+  const agyPath = await findAgyBinary();
+  if (!agyPath) {
+    return { ready: false, message: "agy CLI not found in ~/.local/bin or on PATH" };
+  }
+  return { ready: true };
+}
+
 export default experimental_defineHostEntry({
   contract: agyHostContract,
   handlers: {
@@ -289,5 +392,12 @@ export default experimental_defineHostEntry({
         source: params.source,
       });
     },
+    aiComplete: async (params) => {
+      return runAgyComplete(params.prompt, params.model, params.effort);
+    },
+    aiStatus: async () => {
+      return checkAgyStatus();
+    },
   },
 });
+

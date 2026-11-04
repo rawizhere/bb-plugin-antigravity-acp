@@ -41,6 +41,7 @@ bb plugin reload google-antigravity-acp
 | `binDir` | `~/.local/bin` | Where the server binary and sandbox helper are linked; must be on the machine's PATH. |
 | `defaultModel` | *(empty — latest Flash)* | Default model family for new threads, e.g. `gemini-3.8-flash` or `gemini-3.1-pro`. |
 | `defaultReasoningEffort` | *(empty — model default)* | Preferred effort variant for the default model: `low`, `medium`, or `high`. |
+| `aiServicesModel` | `gemini-3.8-flash-low` | Model to use for AI services (thread titles / commit messages) via `agy -p`. |
 
 ## Install the server binary
 
@@ -117,6 +118,24 @@ Google's official `agy_acp_server.par` tracks exact token usage inside its local
 The POSIX install renders a lightweight transparent proxy wrapper as `agy_acp_server.par`, pinning the verified Node interpreter and installed real-binary path while keeping the official raw binary intact (`agy_acp_server_raw.par`). Installation verifies an ACP `initialize` handshake before succeeding. Windows currently runs the raw binary without context usage injection. The POSIX wrapper reads token usage metadata in real time from the session database and injects standard ACP `session/update` (`usage_update`) events with `used` and `size` before turn completion.
 
 This enables BB's native context window tracking and context meter plugins (such as `context-meter`) to display live token usage for Antigravity threads.
+
+## AI Services (thread titles and commit messages)
+
+This plugin registers Antigravity as an AI service provider for BB helper tasks (`thread-title` and `commit-message`), executing fast inference via the host machine's local `agy` CLI (`agy -p`).
+
+To configure Antigravity as your AI service:
+
+```sh
+bb settings ai-services set thread-title antigravity
+bb settings ai-services set commit-message antigravity
+```
+
+Test the integration:
+
+```sh
+bb settings ai-services test thread-title
+bb settings ai-services test commit-message
+```
 
 ## Security notes
 

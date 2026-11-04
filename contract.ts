@@ -39,4 +39,23 @@ export const agyHostContract = defineRpcContract({
       error: z.string().nullable(),
     }),
   },
+  aiComplete: {
+    input: z.object({
+      prompt: z.string(),
+      model: z.string().optional(),
+      effort: z.string().optional(),
+    }).strict(),
+    output: z.object({
+      ok: z.boolean(),
+      text: z.string(),
+      error: z.string().nullable(),
+    }),
+  },
+  aiStatus: {
+    input: z.null(),
+    output: z.object({
+      ready: z.boolean(),
+      message: z.string().optional(),
+    }),
+  },
 });

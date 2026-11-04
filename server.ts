@@ -36,6 +36,13 @@ export default async function plugin(bb: BbPluginApi) {
         "Preferred reasoning effort for the default model (e.g. low, medium, high). Leave empty to use the model's own default.",
       default: "",
     },
+    aiServicesModel: {
+      type: "string",
+      label: "Model for thread titles and commit messages",
+      description:
+        "Model used by Antigravity AI service (default: gemini-3.8-flash-low for fast responses).",
+      default: "gemini-3.8-flash-low",
+    },
   });
   let saved = await settings.get();
 
@@ -125,6 +132,44 @@ export default async function plugin(bb: BbPluginApi) {
   });
 
   const host = bb.hosts.experimental_client({ contract: agyHostContract });
+
+  async function getPrimaryHostId(): Promise<string> {
+    const config = await bb.sdk.system.config();
+    if (config.primaryHostId) return config.primaryHostId;
+    const hosts = await bb.sdk.hosts.list({});
+    if (hosts.length > 0) return hosts[0].id;
+    throw new Error("No host machine is connected");
+  }
+
+  bb.experimental_aiServices.register({
+    id: "antigravity",
+    displayName: "Antigravity",
+    async complete(prompt, { signal }) {
+      const hostId = await getPrimaryHostId();
+      const current = await settings.get();
+      const res = await host.call(
+        "aiComplete",
+        {
+          prompt,
+          model: current.aiServicesModel?.trim() || "gemini-3.8-flash-low",
+          effort: "low",
+        },
+        { hostId, signal, timeoutMs: 15000 },
+      );
+      if (!res.ok) {
+        throw new Error(res.error ?? "Antigravity AI completion failed");
+      }
+      return res.text;
+    },
+    async status() {
+      try {
+        const hostId = await getPrimaryHostId();
+        return await host.call("aiStatus", null, { hostId, timeoutMs: 5000 });
+      } catch (err) {
+        return { ready: false, message: (err as Error).message };
+      }
+    },
+  });
 
 
 
