@@ -10,6 +10,7 @@ import {
 import { experimental_defineHostEntry } from "@get-bb/plugin-sdk/host";
 import { agyHostContract } from "./contract.js";
 import { localizeLaunchSpec, probeLocal, runInstall } from "./install.js";
+import { withSessionRecovery } from "./session-recovery.js";
 
 import {
   normalizeModelId,
@@ -205,7 +206,7 @@ async function refreshModels(launchSpec?: { command: string; args: string[]; env
 // Attempt initial load from disk cache
 loadFromDiskCache();
 
-export const experimental_providerBridge = {
+export const experimental_providerBridge = withSessionRecovery({
   experimental_apiVersion: 1 as const,
   handleLine: async (line: string) => {
     try {
@@ -272,7 +273,7 @@ export const experimental_providerBridge = {
   onClose: () => {
     return experimental_acpProviderBridge.onClose?.();
   },
-};
+});
 
 export default experimental_defineHostEntry({
   contract: agyHostContract,

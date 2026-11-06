@@ -118,6 +118,22 @@ The POSIX install renders a lightweight transparent proxy wrapper as `agy_acp_se
 
 This enables BB's native context window tracking and context meter plugins (such as `context-meter`) to display live token usage for Antigravity threads.
 
+## Session failure recovery
+
+If Antigravity reports `Session not found` for its current session, or reports
+that it failed to rebuild a lost agent connection, the host bridge sends BB's
+typed `restartRecommended` recovery hint. BB owns restarting the bridge and
+restoring the saved conversation. The original error remains visible; a
+shared-process restart waits for other active threads to settle.
+
+The adapter never replays the failed prompt or retries tool operations. Further
+turns targeting the broken runtime are rejected until a successful restore.
+Only provider error envelopes are inspected, not model text or tool output.
+Errors for unrelated sessions and MCP connection timeouts alone do not trigger
+recovery. If restoration itself fails, that failure is surfaced without
+requesting another automatic restart. No conversation databases are edited or
+deleted. A persistently unavailable MCP still needs its connection fixed.
+
 ## Security notes
 
 - The ACP registry is fetched from a **pinned commit** (`REGISTRY_COMMIT`),

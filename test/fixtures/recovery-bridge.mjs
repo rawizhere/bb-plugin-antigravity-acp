@@ -1,0 +1,10 @@
+import { createRequire } from "node:module";
+import readline from "node:readline";
+globalThis.require = createRequire(import.meta.url);
+const { experimental_acpProviderBridge } = await import("@get-bb/plugin-sdk/provider-bridge/acp");
+const { withSessionRecovery } = await import("../../session-recovery.ts");
+const bridge = withSessionRecovery(experimental_acpProviderBridge);
+bridge.start({ pluginId: "test", dataDir: process.env.RECOVERY_TEST_ROOT, tempDir: process.env.RECOVERY_TEST_ROOT });
+const input = readline.createInterface({ input: process.stdin });
+input.on("line", line => bridge.handleLine(line));
+input.on("close", () => bridge.onClose());
