@@ -29,6 +29,7 @@ bb plugin install git:github.com/rawizhere/bb-plugin-antigravity-acp --yes
 For development, install from a checkout instead:
 
 ```sh
+npm install                          # install dependencies (including zod)
 bb plugin install .                  # from this directory
 bb plugin reload google-antigravity-acp
 ```
